@@ -1,0 +1,345 @@
+import sys
+import os
+import ollama
+import fitz  # PyMuPDF
+import pdfplumber
+import pandas as pd
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QPushButton, QTextEdit, QFileDialog,
+    QLabel, QSplitter, QMessageBox, QScrollArea, QProgressBar,
+    QCheckBox, QGroupBox, QDialog
+)
+from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from fpdf import FPDF
+from docx import Document
+
+# --- WORKER THREAD FOR AI ---
+class AIWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def run(self):
+        try:
+            prompt = (
+                f"Analyze this document. Provide a summary of key objectives, "
+                f"technical findings, and conclusions:\n\n{self.text[:8000]}"
+            )
+            response = ollama.generate(model='llama3', prompt=prompt)
+            self.finished.emit(response['response'])
+        except Exception as e:
+            self.error.emit(str(e))
+
+# --- MAIN APPLICATION ---
+class OfflineApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Offline AI Document Assistant - Pro Edition")
+        self.resize(1400, 900)
+        
+        self.file_path = ""
+        self.doc = None
+        self.current_pdf_text = ""
+        self.current_ai_summary = "No summary generated yet."
+        
+        self.init_ui()
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ==========================================
+        # --- LEFT SIDE: Document Viewer ---
+        # ==========================================
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        
+        self.upload_btn = QPushButton(" 📂 Upload a PDF or TXT")
+        self.upload_btn.setStyleSheet("height: 50px; font-weight: bold; background-color: #f8f9fa;")
+        self.upload_btn.clicked.connect(self.upload_file)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.page_container = QWidget()
+        self.page_layout = QVBoxLayout(self.page_container)
+        self.scroll_area.setWidget(self.page_container)
+
+        self.text_preview = QTextEdit()
+        self.text_preview.setReadOnly(True)
+        self.text_preview.hide()
+
+        left_layout.addWidget(self.upload_btn)
+        left_layout.addWidget(self.scroll_area)
+        left_layout.addWidget(self.text_preview)
+
+        # ==========================================
+        # --- RIGHT SIDE: Tools & AI ---
+        # ==========================================
+        # ==========================================
+        # --- RIGHT SIDE: Tools & AI ---
+        # ==========================================
+        # ==========================================
+        # --- RIGHT SIDE: Tools & AI ---
+        # ==========================================
+        right_container = QWidget()
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setSpacing(12) # Adds a nice gap between each row
+
+        # 1. TOP BAR: Just the AI Icon on the far right
+        top_bar_layout = QHBoxLayout()
+        top_bar_layout.addStretch() # Pushes the icon to the right
+        
+        self.ai_icon_btn = QPushButton("🤖")
+        self.ai_icon_btn.setFixedSize(65, 65)
+        self.ai_icon_btn.setToolTip("Click to view AI Summary")
+        self.ai_icon_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 30px; 
+                border-radius: 32px; 
+                background-color: #f8f9fa;
+                border: 2px solid #ced4da;
+            }
+            QPushButton:hover { background-color: #e2e6ea; }
+        """)
+        self.ai_icon_btn.clicked.connect(self.show_ai_summary_popup)
+        top_bar_layout.addWidget(self.ai_icon_btn)
+        
+        right_layout.addLayout(top_bar_layout)
+
+        # 2. STATUS BAR (Full width)
+        self.status_group = QGroupBox("Status Bar")
+        status_layout = QHBoxLayout() # Keeps checkboxes side-by-side
+        self.check_upload = QCheckBox("File Uploaded")
+        self.check_tables = QCheckBox("Tables Scanned")
+        self.check_ai = QCheckBox("AI Analysis Done")
+        
+        for cb in [self.check_upload, self.check_tables, self.check_ai]:
+            cb.setEnabled(False) 
+            status_layout.addWidget(cb)
+            
+        self.status_group.setLayout(status_layout)
+        right_layout.addWidget(self.status_group)
+        
+        # 3. PROGRESS & TOOLS
+        self.status_label = QLabel("Ready")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0) 
+        self.progress_bar.hide()
+        
+        self.scan_tables_btn = QPushButton(" 📊 Scan for Tables")
+        self.scan_tables_btn.setFixedHeight(40)
+        self.scan_tables_btn.clicked.connect(self.scan_tables)
+
+        right_layout.addWidget(self.status_label)
+        right_layout.addWidget(self.progress_bar)
+        right_layout.addWidget(self.scan_tables_btn)
+
+        # 4. MANUAL ENTRY (Directly underneath the tools)
+        right_layout.addWidget(QLabel(" ✍️ Manual Data & Tables:"))
+        self.manual_input = QTextEdit()
+        self.manual_input.setPlaceholderText("Manual notes and scanned tables will appear here...")
+        right_layout.addWidget(self.manual_input)
+
+        # 5. BOTTOM SECTION: Export Buttons
+        btn_layout = QHBoxLayout()
+        self.save_pdf_btn = QPushButton(" 💾 View PDF")
+        self.save_docx_btn = QPushButton(" 📝 Save as Word")
+        self.save_pdf_btn.setFixedHeight(45)
+        self.save_docx_btn.setFixedHeight(45)
+        self.save_pdf_btn.clicked.connect(self.export_pdf)
+        self.save_docx_btn.clicked.connect(self.export_docx)
+        
+        btn_layout.addWidget(self.save_pdf_btn)
+        btn_layout.addWidget(self.save_docx_btn)
+        
+        right_layout.addLayout(btn_layout)
+
+        # Add everything to the main Splitter
+        self.splitter.addWidget(left_container)
+        self.splitter.addWidget(right_container)
+        self.splitter.setStretchFactor(0, 5) # Viewer gets half the screen
+        self.splitter.setStretchFactor(1, 5) # Right side gets the other half
+        layout.addWidget(self.splitter)
+
+    # ==========================================
+    # --- LOGIC & FUNCTIONS ---
+    # ==========================================
+    def reset_status(self):
+        self.check_upload.setChecked(False)
+        self.check_tables.setChecked(False)
+        self.check_ai.setChecked(False)
+        self.current_ai_summary = "No summary generated yet."
+        self.ai_icon_btn.setStyleSheet("""
+            QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
+            QPushButton:hover { background-color: #e2e6ea; }
+        """)
+
+    def clear_preview(self):
+        while self.page_layout.count():
+            child = self.page_layout.takeAt(0)
+            if child.widget(): child.widget().deleteLater()
+
+    def upload_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Document", "", "Documents (*.pdf *.txt)")
+        if path:
+            self.file_path = path
+            self.reset_status()
+            self.clear_preview()
+            
+            try:
+                if path.lower().endswith('.pdf'):
+                    self.text_preview.hide()
+                    self.scroll_area.show()
+                    self.doc = fitz.open(path)
+                    text = ""
+                    for i, page in enumerate(self.doc):
+                        text += page.get_text()
+                        if i < 15: 
+                            pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+                            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+                            lbl = QLabel()
+                            lbl.setPixmap(QPixmap.fromImage(img).scaledToWidth(600, Qt.TransformationMode.SmoothTransformation))
+                            self.page_layout.addWidget(lbl)
+                    self.current_pdf_text = text
+                else:
+                    self.scroll_area.hide()
+                    self.text_preview.show()
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        self.current_pdf_text = f.read()
+                    self.text_preview.setText(self.current_pdf_text)
+
+                self.check_upload.setChecked(True)
+                # ERROR FIX: Uses the thread instead of fetch_ai_summary!
+                self.start_ai_thread(self.current_pdf_text) 
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not load file: {str(e)}")
+
+    def start_ai_thread(self, text):
+        self.status_label.setText("AI is analyzing document...")
+        self.progress_bar.show()
+        self.worker = AIWorker(text)
+        self.worker.finished.connect(self.handle_ai_done)
+        self.worker.error.connect(lambda e: self.status_label.setText(f"AI Error: {e}"))
+        self.worker.start()
+
+    def handle_ai_done(self, summary):
+        self.current_ai_summary = summary
+        self.progress_bar.hide()
+        self.status_label.setText("Analysis Complete")
+        self.check_ai.setChecked(True)
+        self.ai_icon_btn.setStyleSheet("""
+            QPushButton { font-size: 30px; border-radius: 32px; background-color: #d4edda; border: 2px solid #28a745; }
+            QPushButton:hover { background-color: #c3e6cb; }
+        """)
+
+    def show_ai_summary_popup(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("🤖 AI Automated Summary")
+        dialog.resize(700, 500)
+        layout = QVBoxLayout(dialog)
+        
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setText(self.current_ai_summary)
+        text_edit.setStyleSheet("font-size: 14px; line-height: 1.6; padding: 10px;")
+        
+        close_btn = QPushButton("Close")
+        close_btn.setFixedHeight(40)
+        close_btn.clicked.connect(dialog.accept)
+        
+        layout.addWidget(text_edit)
+        layout.addWidget(close_btn)
+        dialog.exec()
+
+    def scan_tables(self):
+        if not self.file_path or not self.file_path.lower().endswith('.pdf'):
+            QMessageBox.warning(self, "Notice", "Table scanning is only available for PDF files.")
+            return
+            
+        self.scan_tables_btn.setText("Scanning... Please wait.")
+        QApplication.processEvents()
+        
+        try:
+            table_content = "\n--- EXTRACTED TABLES ---\n"
+            found_tables = False
+            
+            with pdfplumber.open(self.file_path) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        if table and len(table) > 1:
+                            df = pd.DataFrame(table[1:], columns=table[0])
+                            table_content += df.to_string(index=False) + "\n\n"
+                            found_tables = True
+            
+            if found_tables:
+                self.manual_input.append(table_content)
+                self.check_tables.setChecked(True)
+                QMessageBox.information(self, "Success", "Tables extracted and added to manual notes!")
+            else:
+                QMessageBox.information(self, "No Tables", "Could not find any clear data tables in this document.")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Table Scan Error", str(e))
+            
+        self.scan_tables_btn.setText(" 📊 Scan for Tables")
+
+    def export_pdf(self):
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save PDF", "Final_Report.pdf", "PDF (*.pdf)")
+        if save_path:
+            try:
+                pdf = FPDF()
+                pdf.add_page()
+                pdf.set_font("Arial", size=11)
+                
+                ai_text = self.current_ai_summary.encode('latin-1', 'replace').decode('latin-1')
+                manual_text = self.manual_input.toPlainText().encode('latin-1', 'replace').decode('latin-1')
+                
+                pdf.set_font("Arial", 'B', 14)
+                pdf.cell(0, 10, "1. AI AUTOMATED SUMMARY", ln=True)
+                pdf.set_font("Arial", size=11)
+                pdf.multi_cell(0, 8, ai_text)
+                
+                pdf.ln(10)
+                
+                pdf.set_font("Arial", 'B', 14)
+                pdf.cell(0, 10, "2. NOTES & TABLES", ln=True)
+                pdf.set_font("Arial", size=11)
+                pdf.multi_cell(0, 8, manual_text)
+                
+                pdf.output(save_path)
+                QMessageBox.information(self, "Success", "PDF Saved Successfully!")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+    def export_docx(self):
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Word", "Final_Report.docx", "Word (*.docx)")
+        if save_path:
+            try:
+                doc = Document()
+                doc.add_heading('Document Analysis Report', 0)
+                
+                doc.add_heading('1. AI Automated Summary', level=1)
+                doc.add_paragraph(self.current_ai_summary)
+                
+                doc.add_heading('2. Manual Notes & Extracted Tables', level=1)
+                doc.add_paragraph(self.manual_input.toPlainText())
+                
+                doc.save(save_path)
+                QMessageBox.information(self, "Success", "Word Document Saved Successfully!")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = OfflineApp()
+    window.show()
+    sys.exit(app.exec())
