@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Converter</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="container">
+
+    <!-- LEFT -->
+    <div class="left">
+
+        <div class="card">
+            <button class="upload-btn" onclick="uploadPDF()">Upload PDF</button>
+
+            <div id="preview"></div>
+        </div>
+
+    </div>
+
+    <!-- RIGHT -->
+    <div class="right">
+
+        <!-- STATUS -->
+        <!-- STATUS -->
+<div class="card">
+    <h3>Document Status</h3>
+
+    <table id="statusTable">
+        <tr>
+            <th>Heading</th>
+            <th>Status</th>
+        </tr>
+    </table>
+
+    <!-- Centered small button -->
+    <div class="center-btn">
+        <button class="add-btn" onclick="addEntry()">+ Add Heading</button>
+    </div>
+</div>
+
+<!-- ACTIONS -->
+<div class="card">
+    <h3>Actions</h3>
+
+    <div class="buttons">
+        <button onclick="downloadDocx()">Download as DOCX</button>
+        <button onclick="downloadPDF()">Download as PDF</button>
+        <button onclick="previewTemplate()">Preview in Template</button>
+    </div>
+</div>
+
+    </div>
+
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
