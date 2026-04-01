@@ -406,7 +406,7 @@ class OfflineApp(QMainWindow):
         self.progress_bar.hide()
         self.status_label.setText("Analysis Complete")
         self.check_ai.setChecked(True)
-        self.ai_icon_bgtn.setStyleSheet("""
+        self.ai_icon_btn.setStyleSheet("""
             QPushButton { font-size: 24px; border-radius: 25px; background-color: #d4edda; border: 2px solid #28a745; color: black; padding: 0; }
             QPushButton:hover { background-color: #c3e6cb; }
         """)
