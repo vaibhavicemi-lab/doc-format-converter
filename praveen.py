@@ -5,7 +5,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QTextEdit, QFileDialog,
     QLabel, QSplitter, QMessageBox, QScrollArea, QProgressBar,
-    QCheckBox, QGroupBox, QDialog, QRubberBand, QMenu
+    QCheckBox, QGroupBox, QDialog, QRubberBand, QMenu, QLineEdit,
+    QGridLayout 
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QTextDocument, QTextCursor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QRect, QPoint, QSize
@@ -20,40 +21,28 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 # ==========================================
-# --- PURE PYTHON SUMMARIZER (NO AI NEEDED) ---
+# --- PURE PYTHON SUMMARIZER ---
 # ==========================================
 def simple_summarize(text, num_sentences=4):
-    """A standard NLP extractive summarizer using word frequencies."""
     if not text: return ""
-    
     stop_words = {"the", "is", "in", "and", "to", "of", "a", "for", "on", "with", "as", "by", "this", "that", "it", "are", "be", "or", "an", "at", "from", "which", "will"}
-    
-    # Split text into sentences
     sentences = re.split(r'(?<=[.!?]) +|\n+', text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
-    
-    if len(sentences) <= num_sentences:
-        return " ".join(sentences)
+    if len(sentences) <= num_sentences: return " ".join(sentences)
         
-    # Calculate word frequencies
     words = re.findall(r'\b\w+\b', text.lower())
     freq = {}
     for w in words:
-        if w not in stop_words and not w.isnumeric():
-            freq[w] = freq.get(w, 0) + 1
+        if w not in stop_words and not w.isnumeric(): freq[w] = freq.get(w, 0) + 1
             
-    # Score sentences based on high-frequency words
     scores = {}
     for i, s in enumerate(sentences):
         score = 0
         s_words = re.findall(r'\b\w+\b', s.lower())
         for w in s_words:
-            if w in freq:
-                score += freq[w]
-        # Normalize score by sentence length to balance long/short sentences
+            if w in freq: score += freq[w]
         scores[i] = score / max(len(s_words), 1)
         
-    # Get the top sentences in their original order
     top_indices = sorted(sorted(scores, key=scores.get, reverse=True)[:num_sentences])
     return " ".join([sentences[i] for i in top_indices])
 
@@ -82,28 +71,91 @@ class NotesEditor(QTextEdit):
         super().insertFromMimeData(source)
 
 # ==========================================
+# --- PURE CODE ANALYSIS WORKER ---
+# ==========================================
+class AnalysisWorker(QThread):
+    finished = pyqtSignal(dict) 
+    error = pyqtSignal(str)
+
+    def __init__(self, text, topics):
+        super().__init__()
+        self.text = text
+        self.topics = topics
+
+    def run(self):
+        try:
+            results = {
+                "project_name": "",
+                "introduction": "",
+                "found_topics": []
+            }
+
+            match = re.search(r'Project\s*Name[\s:]*(.+)', self.text, re.IGNORECASE)
+            if match:
+                clean_name = match.group(1).strip()
+                if not clean_name.startswith("___"):
+                    results["project_name"] = clean_name[:60] 
+
+            results["introduction"] = simple_summarize(self.text, num_sentences=4)
+
+            for topic in self.topics:
+                if topic.lower() in self.text.lower():
+                    results["found_topics"].append(topic)
+
+            if results["introduction"] and "Introduction" not in results["found_topics"]:
+                results["found_topics"].append("Introduction")
+
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ==========================================
 # --- INTERACTIVE PDF SNIPPING TOOL ---
+# ==========================================
+# ==========================================
+# --- INTERACTIVE PDF SNIPPING & PANNING TOOL ---
 # ==========================================
 class PdfPageLabel(QLabel):
     text_extracted = pyqtSignal(str)
     image_extracted = pyqtSignal(QPixmap)
-    summary_requested = pyqtSignal(str) # New signal for the summarizer!
+    summary_requested = pyqtSignal(str) 
 
-    def __init__(self, page, parent=None):
+    # NEW: We now pass the scroll_area so the label can move it!
+    def __init__(self, page, scroll_area, parent=None):
         super().__init__(parent)
         self.page = page  
+        self.scroll_area = scroll_area 
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
         self.origin = QPoint()
+        self.pan_start_pos = None # Tracks where the mouse grabbed the page
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.origin = event.pos()
             self.rubber_band.setGeometry(QRect(self.origin, QSize()))
             self.rubber_band.show()
+        # NEW: Right-Click or Middle-Click starts the Panning/Grabbing
+        elif event.button() in [Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton]:
+            self.pan_start_pos = event.globalPosition().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event):
-        if not self.origin.isNull():
+        # Snipping Tool Drag
+        if not self.origin.isNull() and (event.buttons() & Qt.MouseButton.LeftButton):
             self.rubber_band.setGeometry(QRect(self.origin, event.pos()).normalized())
+            
+        # NEW: Panning Tool Drag
+        elif self.pan_start_pos is not None and (event.buttons() & (Qt.MouseButton.RightButton | Qt.MouseButton.MiddleButton)):
+            current_pos = event.globalPosition().toPoint()
+            delta = current_pos - self.pan_start_pos
+            
+            h_bar = self.scroll_area.horizontalScrollBar()
+            v_bar = self.scroll_area.verticalScrollBar()
+            
+            h_bar.setValue(h_bar.value() - delta.x())
+            v_bar.setValue(v_bar.value() - delta.y())
+            
+            self.pan_start_pos = current_pos
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -113,6 +165,11 @@ class PdfPageLabel(QLabel):
             else:
                 self.rubber_band.hide()
             self.origin = QPoint()
+            
+        # NEW: Stop panning when Right-Click is released
+        elif event.button() in [Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton]:
+            self.unsetCursor()
+            self.pan_start_pos = None
             
     def get_text_from_rect(self, rect):
         if self.pixmap() and self.page:
@@ -128,14 +185,12 @@ class PdfPageLabel(QLabel):
         copy_img_action = menu.addAction("🖼️ Extract as Image")
         copy_text_action = menu.addAction("📝 Extract Text to Notes")
         menu.addSeparator()
-        # The new Summarization button!
         summarize_action = menu.addAction("✨ Summarize Selection (Set as Intro)")
 
         action = menu.exec(self.mapToGlobal(pos))
         
         if action == copy_img_action:
-            if self.pixmap():
-                self.image_extracted.emit(self.pixmap().copy(rect)) 
+            if self.pixmap(): self.image_extracted.emit(self.pixmap().copy(rect)) 
         elif action == copy_text_action:
             text = self.get_text_from_rect(rect)
             if text: self.text_extracted.emit(text) 
@@ -151,16 +206,17 @@ class PdfPageLabel(QLabel):
 class OfflineApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Offline Document Assistant - Template Edition")
-        self.resize(1400, 900)
+        self.setWindowTitle("Offline Document Assistant - Fast Analyzer")
+        self.resize(1450, 950) 
         
         self.file_path = ""
         self.doc = None
-        self.current_pdf_text = ""
-        self.current_summary = "No introduction summary set yet. Select text on the PDF and right-click to summarize it!"
         self.page_data = [] 
         self.current_zoom = 600 
         self.is_maximized = False
+        
+        # Variable to hold the hidden summary text
+        self.intro_text_data = "" 
         
         self.init_ui()
 
@@ -202,9 +258,9 @@ class OfflineApp(QMainWindow):
         self.scroll_area.setStyleSheet("background-color: #525659;") 
         self.page_container = QWidget()
         self.page_layout = QVBoxLayout(self.page_container)
-        self.page_layout.setAlignment(Qt.AlignmentFlag.AlignTop) 
+        # Added alignment to center the PDF perfectly
+        self.page_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter) 
         self.scroll_area.setWidget(self.page_container)
-        self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter) 
         self.scroll_area.viewport().installEventFilter(self)
 
         self.text_preview = QTextEdit()
@@ -222,48 +278,101 @@ class OfflineApp(QMainWindow):
         self.right_container = QWidget() 
         right_layout = QVBoxLayout(self.right_container)
 
-        top_bar_layout = QHBoxLayout()
-        self.status_group = QGroupBox("Status Bar")
-        status_layout = QHBoxLayout() 
-        self.check_upload = QCheckBox("File Uploaded")
-        self.check_summary = QCheckBox("Intro Set")
-        for cb in [self.check_upload, self.check_summary]:
-            cb.setEnabled(False) 
-            status_layout.addWidget(cb)
-        self.status_group.setLayout(status_layout)
-        top_bar_layout.addWidget(self.status_group)
+        # --- HEADER ROW (Checklist + 📑 Icon) ---
+        header_layout = QHBoxLayout()
+
+        self.status_group = QGroupBox("Task Directive Extraction Checklist")
+        self.status_group.setMaximumHeight(190) # FIX 1: Prevents the box from stretching vertically!
         
+        status_main_layout = QVBoxLayout()
+        status_main_layout.setContentsMargins(10, 15, 10, 10) # FIX 2: Tightens the padding inside
+        status_main_layout.setSpacing(5) # FIX 3: Pushes the top row and scroll box closer together
+        
+        top_status = QHBoxLayout()
+        self.check_upload = QCheckBox("File Uploaded")
+        self.check_upload.setEnabled(False)
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: gray; font-style: italic;")
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0) 
+        self.progress_bar.hide()
+        
+        top_status.addWidget(self.check_upload)
+        top_status.addStretch()
+        top_status.addWidget(self.status_label)
+        top_status.addWidget(self.progress_bar) 
+        status_main_layout.addLayout(top_status)
+        
+        self.topics = [
+            "Introduction", "Reference", "Basis Of Task Directive",
+            "Scope Of Task Directive", "Stakeholders", "Certification Work Breakdown",
+            "Task Allocation", "Coordinating Directorate", "Single Point of Contact",
+            "Certification Task Allocation", "Issue of Clearance", "SCRB And TARB",
+            "Communication", "Certification Progress Review", "Distribution List"
+        ]
+        self.topic_checkboxes = {}
+        
+        topics_scroll = QScrollArea()
+        topics_scroll.setWidgetResizable(True)
+        topics_scroll.setFixedHeight(120) 
+        topics_scroll.setStyleSheet("QScrollArea { border: 1px solid #ced4da; border-radius: 4px; background-color: #f8f9fa; }")
+        
+        topics_widget = QWidget()
+        topics_layout = QGridLayout(topics_widget) 
+        topics_layout.setContentsMargins(5, 5, 5, 5)
+        
+        row, col = 0, 0
+        for topic in self.topics:
+            cb = QCheckBox(topic)
+            cb.setStyleSheet("font-size: 11px;")
+            self.topic_checkboxes[topic] = cb
+            topics_layout.addWidget(cb, row, col)
+            col += 1
+            if col > 1: 
+                col = 0
+                row += 1
+
+        topics_scroll.setWidget(topics_widget)
+        status_main_layout.addWidget(topics_scroll)
+        self.status_group.setLayout(status_main_layout)
+        
+        # Add the checklist to the left of the header layout
+        header_layout.addWidget(self.status_group)
+
+        # Add the Summary Icon to the right of the header layout
         self.summary_icon_btn = QPushButton("📑")
         self.summary_icon_btn.setFixedSize(65, 65)
-        self.summary_icon_btn.setToolTip("View Current Introduction Summary")
+        self.summary_icon_btn.setToolTip("View/Edit Introduction Summary")
         self.summary_icon_btn.setStyleSheet("""
             QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
             QPushButton:hover { background-color: #e2e6ea; }
         """)
         self.summary_icon_btn.clicked.connect(self.show_summary_popup)
-        top_bar_layout.addWidget(self.summary_icon_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        header_layout.addWidget(self.summary_icon_btn, alignment=Qt.AlignmentFlag.AlignTop)
 
-        self.status_label = QLabel("Ready")
+        # --- TEXT BOXES ---
+        self.project_name_input = QLineEdit()
+        self.project_name_input.setPlaceholderText("Type or paste Project Name here...")
+        self.project_name_input.setStyleSheet("background-color: white; font-size: 14px; padding: 5px; border: 1px solid #ced4da; border-radius: 4px;")
 
         self.manual_input = NotesEditor()
-        self.manual_input.setPlaceholderText("Extracted text, Stakeholders, and flowcharts will appear here...")
+        self.manual_input.setPlaceholderText("Extract Stakeholders, Scope, and flowcharts here...")
         self.manual_input.setStyleSheet("background-color: white; font-size: 13px;")
 
         btn_layout = QHBoxLayout()
-        self.save_pdf_btn = QPushButton(" 💾 View Basic PDF")
         self.save_docx_btn = QPushButton(" 📝 Generate Task Directive (Word)")
         self.save_docx_btn.setStyleSheet("background-color: #2b579a; color: white; font-weight: bold;")
-        self.save_pdf_btn.setFixedHeight(45)
-        self.save_docx_btn.setFixedHeight(45)
-        self.save_pdf_btn.clicked.connect(self.export_pdf)
+        self.save_docx_btn.setFixedHeight(50)
         self.save_docx_btn.clicked.connect(self.export_docx)
-        btn_layout.addWidget(self.save_pdf_btn)
         btn_layout.addWidget(self.save_docx_btn)
 
-        right_layout.addLayout(top_bar_layout)
-        right_layout.addWidget(self.status_label)
-        right_layout.addWidget(QLabel(" ✍️ Manual Notes & Extracted Data:"))
-        right_layout.addWidget(self.manual_input)
+        # Build the right layout
+        right_layout.addLayout(header_layout) # Contains checklist + 📑 Icon
+        right_layout.addWidget(QLabel(" 🏷️ Project Name:"))
+        right_layout.addWidget(self.project_name_input) 
+        right_layout.addWidget(QLabel(" ✍️ Manual Notes, Stakeholders, & Other Data:"))
+        right_layout.addWidget(self.manual_input) 
         right_layout.addLayout(btn_layout)
 
         self.splitter.addWidget(left_container)
@@ -271,6 +380,31 @@ class OfflineApp(QMainWindow):
         self.splitter.setStretchFactor(0, 5) 
         self.splitter.setStretchFactor(1, 5) 
         layout.addWidget(self.splitter)
+
+    # ------------------------------------------
+    # --- EDITABLE SUMMARY POPUP ---
+    # ------------------------------------------
+    def show_summary_popup(self):
+        """Opens a popup window to view and edit the generated summary."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("📑 Edit Introduction Summary")
+        dialog.resize(600, 400)
+        layout = QVBoxLayout(dialog)
+
+        text_edit = QTextEdit()
+        text_edit.setText(self.intro_text_data)
+        text_edit.setStyleSheet("font-size: 14px; line-height: 1.6; padding: 10px;")
+        
+        # Save the text back to the hidden variable whenever it gets edited
+        text_edit.textChanged.connect(lambda: setattr(self, 'intro_text_data', text_edit.toPlainText()))
+
+        close_btn = QPushButton("Save & Close")
+        close_btn.setFixedHeight(40)
+        close_btn.clicked.connect(dialog.accept)
+
+        layout.addWidget(text_edit)
+        layout.addWidget(close_btn)
+        dialog.exec()
 
     # ------------------------------------------
     # --- AUTO-PASTING FUNCTIONS ---
@@ -290,24 +424,25 @@ class OfflineApp(QMainWindow):
         self.manual_input.append("\n") 
         
     def generate_summary_from_selection(self, text):
-        """Runs the offline Python summarizer on selected text."""
         self.status_label.setText("Summarizing selection...")
         QApplication.processEvents()
-        
-        # Call our standard code summarizer logic
         summary = simple_summarize(text, num_sentences=4)
-        
         if summary:
-            self.current_summary = summary
-            self.status_label.setText("Summary Set")
-            self.check_summary.setChecked(True)
+            # Save the summary to the hidden variable
+            self.intro_text_data = summary 
+            
+            # Make the icon turn green to show it's ready!
             self.summary_icon_btn.setStyleSheet("""
                 QPushButton { font-size: 30px; border-radius: 32px; background-color: #d4edda; border: 2px solid #28a745; }
                 QPushButton:hover { background-color: #c3e6cb; }
             """)
-            QMessageBox.information(self, "Success", "Selection summarized and set as Introduction for your template!")
+            
+            self.status_label.setText("Ready")
+            self.topic_checkboxes["Introduction"].setChecked(True)
+            QMessageBox.information(self, "Success", "Selection summarized! Click the 📑 icon to view or edit it.")
         else:
             self.status_label.setText("Ready")
+            QMessageBox.warning(self, "Empty", "Could not generate a summary. Try selecting a larger paragraph.")
 
     # ------------------------------------------
     # --- UI INTERACTION FUNCTIONS ---
@@ -349,13 +484,10 @@ class OfflineApp(QMainWindow):
                 if child.widget(): child.widget().deleteLater()
             for pixmap, page_idx in self.page_data:
                 page = self.doc.load_page(page_idx)
-                lbl = PdfPageLabel(page)
-                
-                # Connect all our snipping signals
+                lbl = PdfPageLabel(page, self.scroll_area)
                 lbl.text_extracted.connect(self.add_extracted_text)
                 lbl.image_extracted.connect(self.add_extracted_image)
                 lbl.summary_requested.connect(self.generate_summary_from_selection)
-                
                 lbl.setStyleSheet("background-color: white; border: 1px solid black; margin-bottom: 10px;")
                 self.page_layout.addWidget(lbl)
 
@@ -364,6 +496,8 @@ class OfflineApp(QMainWindow):
             if isinstance(lbl, PdfPageLabel) and i < len(self.page_data):
                 scaled_pixmap = self.page_data[i][0].scaledToWidth(self.current_zoom, Qt.TransformationMode.SmoothTransformation)
                 lbl.setPixmap(scaled_pixmap)
+                # Ensure horizontal scrollbar triggers
+                lbl.setFixedSize(scaled_pixmap.size())
 
     # ------------------------------------------
     # --- CORE LOGIC & FUNCTIONS ---
@@ -372,13 +506,19 @@ class OfflineApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open Document", "", "Documents (*.pdf *.txt)")
         if path:
             self.file_path = path
+            
             self.check_upload.setChecked(False)
-            self.check_summary.setChecked(False)
-            self.current_summary = "No introduction summary set yet. Select text on the PDF and right-click to summarize it!"
+            for cb in self.topic_checkboxes.values():
+                cb.setChecked(False)
+                
+            self.project_name_input.clear()
+            self.intro_text_data = "" 
             self.summary_icon_btn.setStyleSheet("""
                 QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
                 QPushButton:hover { background-color: #e2e6ea; }
             """)
+            
+            self.manual_input.clear() 
             self.page_data.clear() 
             
             try:
@@ -405,47 +545,43 @@ class OfflineApp(QMainWindow):
                         self.text_preview.setText(f.read())
 
                 self.check_upload.setChecked(True)
-                self.status_label.setText("Ready. Draw a box over text to summarize!")
+                
+                # Automatically start Pure Python Analysis on upload
+                full_text = self.text_preview.toPlainText() if not self.doc else "".join(page.get_text() for page in self.doc)
+                self.start_analysis_thread(full_text)
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not load file: {str(e)}")
 
-    def show_summary_popup(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("📑 Document Summary")
-        dialog.resize(700, 500)
-        layout = QVBoxLayout(dialog)
-        text_edit = QTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setText(self.current_summary)
-        text_edit.setStyleSheet("font-size: 14px; line-height: 1.6; padding: 10px;")
-        close_btn = QPushButton("Close")
-        close_btn.setFixedHeight(40)
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(text_edit)
-        layout.addWidget(close_btn)
-        dialog.exec()
+    def start_analysis_thread(self, text):
+        self.status_label.setText("Scanning document with Python NLP...")
+        self.progress_bar.show()
+        self.worker = AnalysisWorker(text, self.topics)
+        self.worker.finished.connect(self.handle_analysis_done)
+        self.worker.error.connect(lambda e: self.status_label.setText(f"Analysis Error: {e}"))
+        self.worker.start()
+
+    def handle_analysis_done(self, results):
+        self.progress_bar.hide()
+        self.status_label.setText("Analysis Complete")
+        
+        if results["project_name"]:
+            self.project_name_input.setText(results["project_name"])
+            
+        if results["introduction"]:
+            self.intro_text_data = results["introduction"]
+            self.summary_icon_btn.setStyleSheet("""
+                QPushButton { font-size: 30px; border-radius: 32px; background-color: #d4edda; border: 2px solid #28a745; }
+                QPushButton:hover { background-color: #c3e6cb; }
+            """)
+            
+        for topic in results["found_topics"]:
+            if topic in self.topic_checkboxes:
+                self.topic_checkboxes[topic].setChecked(True)
 
     # ------------------------------------------
     # --- TEMPLATE INJECTION & EXPORT ---
     # ------------------------------------------
-    def export_pdf(self):
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save PDF", "Basic_Report.pdf", "PDF (*.pdf)")
-        if save_path:
-            try:
-                printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-                printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-                printer.setOutputFileName(save_path)
-                ai_html = self.current_summary.replace('\n', '<br>')
-                manual_html = self.manual_input.toHtml()
-                final_html = f"<h1>Document Analysis Report</h1><hr><h2>1. Introduction Summary</h2><p>{ai_html}</p><br><h2>2. Manual Notes & Flowcharts</h2>{manual_html}"
-                doc = QTextDocument()
-                doc.setHtml(final_html)
-                doc.print(printer)
-                QMessageBox.information(self, "Success", "Basic PDF saved successfully!")
-            except Exception as e:
-                QMessageBox.critical(self, "Export Error", str(e))
-
     def export_docx(self):
         save_path, _ = QFileDialog.getSaveFileName(self, "Save Word", "Task_Directive_Final.docx", "Word (*.docx)")
         if not save_path: return
@@ -489,7 +625,11 @@ class OfflineApp(QMainWindow):
             table = doc.add_table(rows=1, cols=2)
             table.cell(0, 0).text = "Issue No."; table.cell(0, 1).text = "Date of Issue:"
 
-            doc.add_paragraph("\nPROJECT NAME: __________________________________________")
+            p_name = self.project_name_input.text().strip()
+            if not p_name or p_name.lower() == "not found":
+                p_name = "__________________________________________"
+            doc.add_paragraph(f"\nPROJECT NAME: {p_name}")
+
             p = doc.add_paragraph("\n\n[ LOGO HERE ]"); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph("ABC Organization").alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph("Address of organization").alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -502,24 +642,21 @@ class OfflineApp(QMainWindow):
             section2.left_margin = Inches(0.75); section2.right_margin = Inches(0.75)
             remove_page_border(section2)
 
-            # --- INJECTING YOUR DATA ---
             add_heading(doc, "1. Introduction [Automated]")
-            # Injects your standard code summarized introduction
-            doc.add_paragraph(self.current_summary)
+            # Pulls text directly from the hidden variable/popup!
+            intro_text = self.intro_text_data.strip()
+            if not intro_text: intro_text = "__________________________________________________"
+            doc.add_paragraph(intro_text)
 
             add_heading(doc, "2. Reference [Default]")
             doc.add_paragraph("__________________________________________________")
-
             add_heading(doc, "3. Basis Of Task Directive [Default]")
             doc.add_paragraph("__________________________________________________")
-
             add_heading(doc, "4. Scope Of Task Directive [Drop down menu]")
-            doc.add_paragraph("To assign the certification respectively")
-            doc.add_paragraph("1) ____\n2) ____\n3) ____")
+            doc.add_paragraph("To assign the certification respectively\n1) ____\n2) ____\n3) ____")
 
             add_heading(doc, "5. Stakeholders [Automated + Manual Notes]")
             doc.add_paragraph("The following are the major stakeholders and manual notes extracted:")
-            # Injects your manual snips here
             doc.add_paragraph(self.manual_input.toPlainText()) 
 
             table = doc.add_table(rows=4, cols=4); table.style = 'Table Grid'
@@ -527,7 +664,6 @@ class OfflineApp(QMainWindow):
 
             add_heading(doc, "6. Certification Work Breakdown [Drop down menu]")
             doc.add_paragraph("______________________________________________")
-
             add_heading(doc, "7. Task Allocation [Default]")
             doc.add_paragraph("______________________________________________")
             add_heading(doc, "7.1 Coordinating Directorate [Default]")
@@ -550,8 +686,7 @@ class OfflineApp(QMainWindow):
             doc.add_paragraph("______________________________________________\n\n(__________)")
 
             add_heading(doc, "11. Distribution List")
-            doc.add_paragraph("11.1 External Organization\n1. ___\n2. ___\n3. ___")
-            doc.add_paragraph("11.2 Internal Distribution")
+            doc.add_paragraph("11.1 External Organization\n1. ___\n2. ___\n3. ___\n11.2 Internal Distribution")
 
             # --- ANNEXURES ---
             doc.add_page_break()
