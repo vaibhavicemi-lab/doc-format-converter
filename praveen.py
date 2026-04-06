@@ -364,7 +364,7 @@ class OfflineApp(QMainWindow):
         self.summary_icon_btn.setFixedSize(65, 65)
         self.summary_icon_btn.setToolTip("View/Edit Introduction Summary")
         self.summary_icon_btn.setStyleSheet("""
-            QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
+            QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da;color:#000000 }
             QPushButton:hover { background-color: #e2e6ea; }
         """)
         self.summary_icon_btn.clicked.connect(self.show_summary_popup)
@@ -373,11 +373,11 @@ class OfflineApp(QMainWindow):
         # --- TEXT BOXES ---
         self.project_name_input = QLineEdit()
         self.project_name_input.setPlaceholderText("Type or paste Project Name here...")
-        self.project_name_input.setStyleSheet("background-color: white; font-size: 14px; padding: 5px; border: 1px solid #ced4da; border-radius: 4px;")
+        self.project_name_input.setStyleSheet("background-color: white; font-size: 14px; padding: 5px; border: 1px solid #ced4da; border-radius: 4px; color:#000000")
 
         self.manual_input = NotesEditor()
         self.manual_input.setPlaceholderText("Extract Stakeholders, Scope, and flowcharts here...")
-        self.manual_input.setStyleSheet("background-color: white; font-size: 13px;")
+        self.manual_input.setStyleSheet("background-color: white; font-size: 13px; color:#000000")
 
         btn_layout = QHBoxLayout()
         self.save_docx_btn = QPushButton(" 📝 Generate Task Directive (Word)")
