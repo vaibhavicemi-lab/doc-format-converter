@@ -71,7 +71,7 @@ class NotesEditor(QTextEdit):
         super().insertFromMimeData(source)
 
 # ==========================================
-# --- PURE CODE ANALYSIS WORKER ---
+# --- PURE CODE ANALYSIS WORKER (SMART EXTRACTION) ---
 # ==========================================
 class AnalysisWorker(QThread):
     finished = pyqtSignal(dict) 
@@ -90,14 +90,33 @@ class AnalysisWorker(QThread):
                 "found_topics": []
             }
 
-            match = re.search(r'Project\s*Name[\s:]*(.+)', self.text, re.IGNORECASE)
-            if match:
-                clean_name = match.group(1).strip()
-                if not clean_name.startswith("___"):
-                    results["project_name"] = clean_name[:60] 
+            # --- 1. SMART PROJECT NAME EXTRACTION ---
+            # Step A: Look for explicit labels
+            explicit_match = re.search(r'(?:Project\s*Name|Project\s*Title|Title|Subject)[\s:]*(.+)', self.text, re.IGNORECASE)
+            if explicit_match and not explicit_match.group(1).strip().startswith("___"):
+                results["project_name"] = explicit_match.group(1).strip()[:100]
+            
+            # Step B: Look for Semantic Clues in the introduction (e.g., "The project aims to...")
+            if not results["project_name"]:
+                semantic_match = re.search(r'(?:project|report|proposal) (?:aims to|focuses on|proposes|is to|investigates) ([^\.]+)', self.text, re.IGNORECASE)
+                if semantic_match:
+                    # Extract the goal and format it nicely as a Title!
+                    results["project_name"] = semantic_match.group(1).strip().title()[:100]
 
+            # Step C: Fallback to the first valid heading at the top of the document
+            if not results["project_name"]:
+                lines = [line.strip() for line in self.text.split('\n') if line.strip()]
+                for line in lines[:10]:
+                    # Skip generic boilerplate text
+                    if re.search(r'(Document Analysis Report|Summary|Page|Date|Author)', line, re.IGNORECASE): continue
+                    if 10 < len(line) < 100:
+                        results["project_name"] = line
+                        break
+
+            # --- 2. EXTRACT INTRODUCTION SUMMARY ---
             results["introduction"] = simple_summarize(self.text, num_sentences=4)
 
+            # --- 3. TOPIC CHECKLIST MATCHING ---
             for topic in self.topics:
                 if topic.lower() in self.text.lower():
                     results["found_topics"].append(topic)
