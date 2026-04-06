@@ -251,7 +251,7 @@ class OfflineApp(QMainWindow):
         left_controls_layout = QHBoxLayout()
         
         self.upload_btn = QPushButton(" 📂 Upload PDF Document")
-        self.upload_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #f8f9fa; padding: 0 15px;")
+        self.upload_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #f8f9fa; padding: 0 15px; color: #000000")
         self.upload_btn.clicked.connect(self.upload_file)
         
         self.zoom_out_btn = QPushButton("➖")
