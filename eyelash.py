@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QPushButton, QTextEdit, QFileDialog,
     QLabel, QSplitter, QMessageBox, QScrollArea, QProgressBar,
     QCheckBox, QGroupBox, QDialog, QRubberBand, QMenu, QLineEdit,
-    QGridLayout 
+    QGridLayout, QListWidget, QListWidgetItem
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QTextDocument, QTextCursor, QDesktopServices 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QRect, QPoint, QSize, QUrl 
@@ -23,50 +23,144 @@ from docx.enum.section import WD_SECTION
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
+
 # ==========================================
-# --- UPGRADED PURE PYTHON SUMMARIZER ---
+# --- CUSTOM UI: INLINE DROPDOWN WITH [+] ---
 # ==========================================
-def simple_summarize(text, target_ratio=0.4, min_sentences=3, max_sentences=10):
-    if not text or len(text.strip()) < 20: return text.strip()
+class DropdownPopup(QDialog):
+    def __init__(self, parent_btn, options):
+        super().__init__(parent_btn, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.parent_btn = parent_btn
+        self.setStyleSheet("""
+            QDialog { background: #FFFFFF; border: 1px solid #ced4da; border-radius: 4px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            QLabel { color: #6B7280; font-size: 11px; font-weight: bold; }
+            QListWidget { background: transparent; border: none; color: #111827; outline: none; font-size: 13px; }
+            QListWidget::item { padding: 6px; border-radius: 4px; }
+            QListWidget::item:hover { background: #F3F4F6; }
+            QLineEdit { background: #FFFFFF; color: #111827; border: 1px solid #2b579a; border-radius: 4px; padding: 4px; }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
-    clean_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
-    sentences = re.split(r'(?<=[.!?])\s+', clean_text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        # Header: Title + Add Button
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(QLabel("SELECT OPTIONS"))
+        header_layout.addStretch()
+        
+        self.add_btn = QPushButton("+")
+        self.add_btn.setFixedSize(22, 22)
+        self.add_btn.setStyleSheet("""
+            QPushButton { background: #F3F4F6; color: #111827; border: 1px solid #D1D5DB; border-radius: 4px; font-weight: bold; font-size: 14px; }
+            QPushButton:hover { background: #E5E7EB; }
+        """)
+        self.add_btn.clicked.connect(self.show_new_input)
+        header_layout.addWidget(self.add_btn)
+        layout.addLayout(header_layout)
 
-    if not sentences: return ""
+        # Hidden Input for new items
+        self.new_input = QLineEdit()
+        self.new_input.setPlaceholderText("Type & press Enter...")
+        self.new_input.hide()
+        self.new_input.returnPressed.connect(self.save_new_option)
+        layout.addWidget(self.new_input)
 
-    num_sentences = int(len(sentences) * target_ratio)
-    num_sentences = max(min_sentences, min(num_sentences, max_sentences))
+        # List of Checkboxes
+        self.list_widget = QListWidget()
+        for opt in options:
+            if opt != "Enter Other...":
+                self.add_item(opt)
+        self.list_widget.itemChanged.connect(self.parent_btn.update_display)
+        layout.addWidget(self.list_widget)
 
-    if len(sentences) <= num_sentences:
-        return " ".join(sentences)
+    def add_item(self, text, checked=False):
+        item = QListWidgetItem(text)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.list_widget.addItem(item)
 
-    stop_words = {"the", "is", "in", "and", "to", "of", "a", "for", "on", "with", "as", "by", "this", "that", "it", "are", "be", "or", "an", "at", "from", "which", "will", "can", "has", "have", "we"}
+    def show_new_input(self):
+        self.new_input.show()
+        self.new_input.setFocus()
 
-    words = re.findall(r'\b[a-zA-Z]{2,}\b', clean_text.lower())
+    def save_new_option(self):
+        text = self.new_input.text().strip()
+        if text:
+            existing = [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+            if text not in existing:
+                self.add_item(text, checked=True)
+            else:
+                for i in range(self.list_widget.count()):
+                    if self.list_widget.item(i).text() == text:
+                        self.list_widget.item(i).setCheckState(Qt.CheckState.Checked)
+        self.new_input.clear()
+        self.new_input.hide()
+        self.parent_btn.update_display()
+
+class PopupMultiSelect(QPushButton):
+    def __init__(self, options, parent=None):
+        super().__init__("Select options...", parent)
+        self.setStyleSheet("""
+            QPushButton {
+                text-align: left; padding: 8px; background: #FFFFFF; 
+                border: 1px solid #ced4da; border-radius: 4px; color: #111827; font-size: 13px;
+            }
+            QPushButton:hover { border: 1px solid #2b579a; }
+        """)
+        self.options = options
+        self.popup = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if not self.popup:
+                self.popup = DropdownPopup(self, self.options)
+            
+            pos = self.mapToGlobal(self.rect().bottomLeft())
+            self.popup.setFixedWidth(self.width())
+            self.popup.move(pos.x(), pos.y() + 2)
+            self.popup.show()
+
+    def update_display(self):
+        checked = self.checkedItems()
+        if checked:
+            self.setText(", ".join(checked))
+        else:
+            self.setText("Select options...")
+
+    def checkedItems(self):
+        if not self.popup: return []
+        items = []
+        for i in range(self.popup.list_widget.count()):
+            item = self.popup.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                items.append(item.text())
+        return items
+
+
+# ==========================================
+# --- PURE PYTHON SUMMARIZER ---
+# ==========================================
+def simple_summarize(text, num_sentences=4):
+    if not text: return ""
+    stop_words = {"the", "is", "in", "and", "to", "of", "a", "for", "on", "with", "as", "by", "this", "that", "it", "are", "be", "or", "an", "at", "from", "which", "will"}
+    sentences = re.split(r'(?<=[.!?]) +|\n+', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
+    if len(sentences) <= num_sentences: return " ".join(sentences)
+        
+    words = re.findall(r'\b\w+\b', text.lower())
     freq = {}
     for w in words:
-        if w not in stop_words:
-            freq[w] = freq.get(w, 0) + 1
-
-    max_freq = max(freq.values()) if freq else 1
-    for w in freq:
-        freq[w] = freq[w] / max_freq
-
+        if w not in stop_words and not w.isnumeric(): freq[w] = freq.get(w, 0) + 1
+            
     scores = {}
     for i, s in enumerate(sentences):
         score = 0
-        s_words = re.findall(r'\b[a-zA-Z]{2,}\b', s.lower())
+        s_words = re.findall(r'\b\w+\b', s.lower())
         for w in s_words:
-            if w in freq:
-                score += freq[w]
-
-        score = score / max(len(s_words), 1)
-        if i < 2:
-            score += 0.5
-
-        scores[i] = score
-
+            if w in freq: score += freq[w]
+        scores[i] = score / max(len(s_words), 1)
+        
     top_indices = sorted(sorted(scores, key=scores.get, reverse=True)[:num_sentences])
     return " ".join([sentences[i] for i in top_indices])
 
@@ -101,11 +195,10 @@ class AnalysisWorker(QThread):
     finished = pyqtSignal(dict) 
     error = pyqtSignal(str)
 
-    def __init__(self, text, topics, extra_topics):
+    def __init__(self, text, topics):
         super().__init__()
         self.text = text
         self.topics = topics
-        self.extra_topics = extra_topics
 
     def run(self):
         try:
@@ -115,49 +208,26 @@ class AnalysisWorker(QThread):
                 "found_topics": []
             }
 
-            lines = [line.strip() for line in self.text.split('\n') if line.strip()]
-
-            # --- 1. STRICT PROJECT NAME EXTRACTION ---
+            explicit_match = re.search(r'(?:Project\s*Name|Project\s*Title|Title|Subject)[\s:]*(.+)', self.text, re.IGNORECASE)
+            if explicit_match and not explicit_match.group(1).strip().startswith("___"):
+                results["project_name"] = explicit_match.group(1).strip()[:100]
             
-            # Step A: Explicit Labels (e.g., "Project Name: ...") - ignoring blanks/underscores
-            explicit_match = re.search(r'(?:Project\s*Name|Project\s*Title|Title|Subject)[\s:-]*([^\n]{5,100})', self.text, re.IGNORECASE)
-            if explicit_match and not re.match(r'^[_-\s]+$', explicit_match.group(1)):
-                results["project_name"] = explicit_match.group(1).strip().strip('.:;*-')
-
-            # Step B: Look for Title Case or ALL CAPS headers in the first 10 lines
             if not results["project_name"]:
-                # Aggressive blacklist for generic document headers
-                blacklist = r'^(document|report|summary|page|date|author|introduction|table of contents|index|task directive|automated|version|draft)'
-                for line in lines[:10]:
-                    if re.search(blacklist, line, re.IGNORECASE): continue
-                    
-                    # Clean the line of weird punctuation
-                    clean_line = re.sub(r'[^a-zA-Z0-9\s-]', '', line).strip()
-                    words = clean_line.split()
-                    
-                    # Check if it looks like a visual title (2 to 12 words)
-                    if 2 <= len(words) <= 12:
-                        capitalized_count = sum(1 for w in words if w[0].isupper() or w.isupper())
-                        # If the line is ALL CAPS, or mostly capitalized, it's a real title!
-                        if line.isupper() or (capitalized_count / len(words) >= 0.6):
-                            results["project_name"] = clean_line.title()
-                            break
-
-            # Step C: Semantic Clues with clean truncation
-            if not results["project_name"]:
-                semantic_match = re.search(r'(?:project|report|proposal) (?:aims to|focuses on|proposes|is to|investigates) ([^\.\n]{10,150})', self.text, re.IGNORECASE)
+                semantic_match = re.search(r'(?:project|report|proposal) (?:aims to|focuses on|proposes|is to|investigates) ([^\.]+)', self.text, re.IGNORECASE)
                 if semantic_match:
-                    goal = semantic_match.group(1).strip()
-                    # Truncate to max 12 words so it looks like a title, not a paragraph
-                    words = goal.split()
-                    results["project_name"] = " ".join(words[:12]).title()
+                    results["project_name"] = semantic_match.group(1).strip().title()[:100]
 
-            # --- 2. EXTRACT INTRODUCTION SUMMARY ---
-            results["introduction"] = simple_summarize(self.text)
+            if not results["project_name"]:
+                lines = [line.strip() for line in self.text.split('\n') if line.strip()]
+                for line in lines[:10]:
+                    if re.search(r'(Document Analysis Report|Summary|Page|Date|Author)', line, re.IGNORECASE): continue
+                    if 10 < len(line) < 100:
+                        results["project_name"] = line
+                        break
 
-            # --- 3. TOPIC CHECKLIST MATCHING ---
-            all_topics_to_check = self.topics + self.extra_topics
-            for topic in all_topics_to_check:
+            results["introduction"] = simple_summarize(self.text, num_sentences=4)
+
+            for topic in self.topics:
                 if topic.lower() in self.text.lower():
                     results["found_topics"].append(topic)
 
@@ -233,26 +303,11 @@ class PdfPageLabel(QLabel):
 
     def show_context_menu(self, pos, rect):
         self.rubber_band.hide() 
-        
         menu = QMenu(self)
-        
         menu.setStyleSheet("""
-            QMenu {
-                background-color: white;
-                border: 1px solid #ced4da;
-                border-radius: 4px;
-                padding: 4px;
-                font-size: 13px;
-            }
-            QMenu::item {
-                padding: 6px 25px 6px 20px;
-                background-color: transparent;
-            }
-            QMenu::item:selected {
-                background-color: #e2e6ea;
-                color: black;
-                border-radius: 3px;
-            }
+            QMenu { background-color: white; border: 1px solid #ced4da; border-radius: 4px; padding: 4px; font-size: 13px; }
+            QMenu::item { padding: 6px 25px 6px 20px; background-color: transparent; }
+            QMenu::item:selected { background-color: #e2e6ea; color: black; border-radius: 3px; }
         """)
 
         copy_img_action = menu.addAction("🖼️ Extract as Image")
@@ -277,7 +332,7 @@ class PdfPageLabel(QLabel):
 class OfflineApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Offline Document Assistant - Task Directive Master")
+        self.setWindowTitle("Offline Document Assistant - Fast Analyzer")
         self.resize(1450, 950) 
         
         self.file_path = ""
@@ -287,6 +342,7 @@ class OfflineApp(QMainWindow):
         self.is_maximized = False
         
         self.intro_text_data = "" 
+        self.combos = {}
         
         self.init_ui()
 
@@ -337,7 +393,7 @@ class OfflineApp(QMainWindow):
         self.text_preview.hide()
 
         left_layout.addLayout(left_controls_layout)
-        tip_label = QLabel("💡 Tip: Left-Click & Drag to Extract. Right-Click & Drag to Pan the document!")
+        tip_label = QLabel("💡 Tip: Click and drag on the PDF to extract text, flowcharts, or generate your Introduction Summary!")
         tip_label.setStyleSheet("color: #0056b3; font-style: italic;")
         left_layout.addWidget(tip_label)
         left_layout.addWidget(self.scroll_area)
@@ -348,14 +404,13 @@ class OfflineApp(QMainWindow):
         right_layout = QVBoxLayout(self.right_container)
 
         header_layout = QHBoxLayout()
-        checklists_vbox = QVBoxLayout() 
 
-        # --- 1. FIRST STATUS BAR (15 TOPICS) ---
+        # Checkbox Grid
         self.status_group = QGroupBox("Task Directive Extraction Checklist")
-        self.status_group.setMaximumHeight(160) 
+        self.status_group.setMaximumHeight(190) 
         
         status_main_layout = QVBoxLayout()
-        status_main_layout.setContentsMargins(10, 10, 10, 5) 
+        status_main_layout.setContentsMargins(10, 15, 10, 10) 
         status_main_layout.setSpacing(5) 
         
         top_status = QHBoxLayout()
@@ -385,7 +440,7 @@ class OfflineApp(QMainWindow):
         
         topics_scroll = QScrollArea()
         topics_scroll.setWidgetResizable(True)
-        topics_scroll.setFixedHeight(90) 
+        topics_scroll.setFixedHeight(120) 
         topics_scroll.setStyleSheet("QScrollArea { border: 1px solid #ced4da; border-radius: 4px; background-color: #f8f9fa; }")
         
         topics_widget = QWidget()
@@ -406,51 +461,9 @@ class OfflineApp(QMainWindow):
         topics_scroll.setWidget(topics_widget)
         status_main_layout.addWidget(topics_scroll)
         self.status_group.setLayout(status_main_layout)
+        
+        header_layout.addWidget(self.status_group)
 
-        # --- 2. SECOND STATUS BAR (ADDITIONAL TOPICS) ---
-        self.extra_status_group = QGroupBox("Additional Checks & Statuses")
-        self.extra_status_group.setMaximumHeight(110) 
-        
-        extra_main_layout = QVBoxLayout()
-        extra_main_layout.setContentsMargins(10, 10, 10, 5)
-        extra_main_layout.setSpacing(5)
-        
-        self.extra_topics = [
-            "Extra Topic 1", "Extra Topic 2", "Extra Topic 3", "Extra Topic 4"
-        ]
-        self.extra_checkboxes = {}
-        
-        extra_scroll = QScrollArea()
-        extra_scroll.setWidgetResizable(True)
-        extra_scroll.setFixedHeight(65) 
-        extra_scroll.setStyleSheet("QScrollArea { border: 1px solid #ced4da; border-radius: 4px; background-color: #f8f9fa; }")
-        
-        extra_widget = QWidget()
-        extra_layout = QGridLayout(extra_widget)
-        extra_layout.setContentsMargins(5, 5, 5, 5)
-        
-        row, col = 0, 0
-        for topic in self.extra_topics:
-            cb = QCheckBox(topic)
-            cb.setStyleSheet("font-size: 11px;")
-            self.extra_checkboxes[topic] = cb
-            extra_layout.addWidget(cb, row, col)
-            col += 1
-            if col > 1: 
-                col = 0
-                row += 1
-
-        extra_scroll.setWidget(extra_widget)
-        extra_main_layout.addWidget(extra_scroll)
-        self.extra_status_group.setLayout(extra_main_layout)
-
-        checklists_vbox.addWidget(self.status_group)
-        checklists_vbox.addWidget(self.extra_status_group)
-        header_layout.addLayout(checklists_vbox)
-
-        # --- 3. ICON BUTTONS ---
-        icons_layout = QVBoxLayout()
-        
         self.summary_icon_btn = QPushButton("📑")
         self.summary_icon_btn.setFixedSize(65, 65)
         self.summary_icon_btn.setToolTip("View/Edit Introduction Summary")
@@ -459,43 +472,50 @@ class OfflineApp(QMainWindow):
             QPushButton:hover { background-color: #e2e6ea; }
         """)
         self.summary_icon_btn.clicked.connect(self.show_summary_popup)
-        icons_layout.addWidget(self.summary_icon_btn)
+        header_layout.addWidget(self.summary_icon_btn, alignment=Qt.AlignmentFlag.AlignTop)
 
-        self.notes_icon_btn = QPushButton("📝")
-        self.notes_icon_btn.setFixedSize(65, 65)
-        self.notes_icon_btn.setToolTip("View/Edit Manual Notes & Extracted Data")
-        self.notes_icon_btn.setStyleSheet("""
-            QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
-            QPushButton:hover { background-color: #e2e6ea; }
-        """)
-        self.notes_icon_btn.clicked.connect(self.show_notes_popup)
-        icons_layout.addWidget(self.notes_icon_btn)
-        
-        icons_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        header_layout.addLayout(icons_layout)
+        right_layout.addLayout(header_layout) 
 
-        # --- TEXT BOXES & BUTTONS ---
+        # --- TEXT BOXES & NEW DROPDOWNS ---
+        right_layout.addWidget(QLabel(" 🏷️ Project Name:"))
         self.project_name_input = QLineEdit()
         self.project_name_input.setPlaceholderText("Type or paste Project Name here...")
         self.project_name_input.setStyleSheet("background-color: white; font-size: 14px; padding: 5px; border: 1px solid #ced4da; border-radius: 4px;")
+        right_layout.addWidget(self.project_name_input) 
+        
+        # Inject the new Popup Dropdowns
+        dropdowns_data = [
+            ("Scope Of Task Directive", ["Option 1", "Option 2", "Option 3"]),
+            ("Stakeholders", ["Internal", "External", "Both"]),
+            ("Certification Work Breakdown", ["Type A", "Type B", "Type C"]),
+            ("Task Allocation", ["Auto", "Manual", "Hybrid"]),
+            ("Communication Type", ["Email", "Meeting", "Report"])
+        ]
+        
+        for label_text, items in dropdowns_data:
+            row_layout = QHBoxLayout()
+            lbl = QLabel(f" ⏷ {label_text}:")
+            lbl.setStyleSheet("font-weight: bold; color: #0056b3;")
+            lbl.setFixedWidth(200)
+            combo = PopupMultiSelect(items)
+            self.combos[label_text] = combo
+            row_layout.addWidget(lbl)
+            row_layout.addWidget(combo)
+            right_layout.addLayout(row_layout)
+
+        right_layout.addWidget(QLabel(" ✍️ Manual Notes, Stakeholders, & Other Data:"))
+        self.manual_input = NotesEditor()
+        self.manual_input.setPlaceholderText("Extract Stakeholders, Scope, and flowcharts here...")
+        self.manual_input.setStyleSheet("background-color: white; font-size: 13px;")
+        right_layout.addWidget(self.manual_input) 
 
         btn_layout = QHBoxLayout()
-        self.save_pdf_btn = QPushButton(" 💾 View Basic PDF")
-        self.save_pdf_btn.setFixedHeight(50)
-        self.save_pdf_btn.setStyleSheet("background-color: #f8f9fa; border: 1px solid #ced4da; border-radius: 4px; font-weight: bold;")
-        self.save_pdf_btn.clicked.connect(self.export_pdf)
-        btn_layout.addWidget(self.save_pdf_btn)
-
         self.save_docx_btn = QPushButton(" 📝 Generate Task Directive (Word)")
-        self.save_docx_btn.setStyleSheet("background-color: #2b579a; color: white; font-weight: bold; border-radius: 4px;")
+        self.save_docx_btn.setStyleSheet("background-color: #2b579a; color: white; font-weight: bold;")
         self.save_docx_btn.setFixedHeight(50)
         self.save_docx_btn.clicked.connect(self.export_docx)
         btn_layout.addWidget(self.save_docx_btn)
-
-        right_layout.addLayout(header_layout) 
-        right_layout.addWidget(QLabel(" 🏷️ Project Name:"))
-        right_layout.addWidget(self.project_name_input) 
-        right_layout.addStretch() 
+        
         right_layout.addLayout(btn_layout)
 
         self.splitter.addWidget(left_container)
@@ -503,35 +523,10 @@ class OfflineApp(QMainWindow):
         self.splitter.setStretchFactor(0, 5) 
         self.splitter.setStretchFactor(1, 5) 
         layout.addWidget(self.splitter)
-        
-        self.init_notes_dialog()
 
     # ------------------------------------------
-    # --- EDITABLE POPUPS ---
+    # --- EDITABLE SUMMARY POPUP ---
     # ------------------------------------------
-    def init_notes_dialog(self):
-        """Creates the persistent dialog for Manual Notes so images aren't lost."""
-        self.notes_dialog = QDialog(self)
-        self.notes_dialog.setWindowTitle("📝 Manual Notes & Extracted Data")
-        self.notes_dialog.resize(700, 600)
-        notes_layout = QVBoxLayout(self.notes_dialog)
-        
-        self.manual_input = NotesEditor()
-        self.manual_input.setPlaceholderText("Extracted text, Stakeholders, and flowcharts will appear here...")
-        self.manual_input.setStyleSheet("background-color: white; font-size: 14px; border: 1px solid #ced4da;")
-        
-        close_notes_btn = QPushButton("Save & Hide")
-        close_notes_btn.setFixedHeight(40)
-        close_notes_btn.clicked.connect(self.notes_dialog.hide)
-        
-        notes_layout.addWidget(self.manual_input)
-        notes_layout.addWidget(close_notes_btn)
-
-    def show_notes_popup(self):
-        self.notes_dialog.show()
-        self.notes_dialog.raise_()
-        self.notes_dialog.activateWindow()
-
     def show_summary_popup(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("📑 Edit Introduction Summary")
@@ -555,16 +550,9 @@ class OfflineApp(QMainWindow):
     # ------------------------------------------
     # --- AUTO-PASTING FUNCTIONS ---
     # ------------------------------------------
-    def flash_notes_icon(self):
-        self.notes_icon_btn.setStyleSheet("""
-            QPushButton { font-size: 30px; border-radius: 32px; background-color: #d4edda; border: 2px solid #28a745; }
-            QPushButton:hover { background-color: #c3e6cb; }
-        """)
-
     def add_extracted_text(self, text):
         QApplication.clipboard().setText(text) 
         self.manual_input.append(text + "\n")
-        self.flash_notes_icon()
         
     def add_extracted_image(self, pixmap):
         if pixmap.width() > 500:
@@ -575,14 +563,11 @@ class OfflineApp(QMainWindow):
         self.manual_input.setTextCursor(cursor)
         cursor.insertImage(pixmap.toImage()) 
         self.manual_input.append("\n") 
-        self.flash_notes_icon()
         
     def generate_summary_from_selection(self, text):
         self.status_label.setText("Summarizing selection...")
         QApplication.processEvents()
-        
-        summary = simple_summarize(text)
-        
+        summary = simple_summarize(text, num_sentences=4)
         if summary:
             self.intro_text_data = summary 
             self.summary_icon_btn.setStyleSheet("""
@@ -661,18 +646,20 @@ class OfflineApp(QMainWindow):
             self.check_upload.setChecked(False)
             for cb in self.topic_checkboxes.values():
                 cb.setChecked(False)
-            for cb in self.extra_checkboxes.values():
-                cb.setChecked(False)
                 
             self.project_name_input.clear()
             self.intro_text_data = "" 
-            
-            default_icon_style = """
+            self.summary_icon_btn.setStyleSheet("""
                 QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
                 QPushButton:hover { background-color: #e2e6ea; }
-            """
-            self.summary_icon_btn.setStyleSheet(default_icon_style)
-            self.notes_icon_btn.setStyleSheet(default_icon_style)
+            """)
+            
+            # Reset Combos
+            for combo in self.combos.values():
+                if combo.popup:
+                    for i in range(combo.popup.list_widget.count()):
+                        combo.popup.list_widget.item(i).setCheckState(Qt.CheckState.Unchecked)
+                combo.setText("Select options...")
             
             self.manual_input.clear() 
             self.page_data.clear() 
@@ -711,7 +698,7 @@ class OfflineApp(QMainWindow):
     def start_analysis_thread(self, text):
         self.status_label.setText("Scanning document with Python NLP...")
         self.progress_bar.show()
-        self.worker = AnalysisWorker(text, self.topics, self.extra_topics)
+        self.worker = AnalysisWorker(text, self.topics)
         self.worker.finished.connect(self.handle_analysis_done)
         self.worker.error.connect(lambda e: self.status_label.setText(f"Analysis Error: {e}"))
         self.worker.start()
@@ -733,35 +720,10 @@ class OfflineApp(QMainWindow):
         for topic in results["found_topics"]:
             if topic in self.topic_checkboxes:
                 self.topic_checkboxes[topic].setChecked(True)
-            if topic in self.extra_checkboxes:
-                self.extra_checkboxes[topic].setChecked(True)
 
     # ------------------------------------------
     # --- TEMPLATE INJECTION & EXPORT ---
     # ------------------------------------------
-    def export_pdf(self):
-        try:
-            temp_file = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            temp_path = temp_file.name
-            temp_file.close() 
-
-            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-            printer.setOutputFileName(temp_path)
-            
-            ai_html = self.intro_text_data.replace('\n', '<br>')
-            manual_html = self.manual_input.toHtml()
-            final_html = f"<h1>Document Analysis Report</h1><hr><h2>1. Introduction Summary</h2><p>{ai_html}</p><br><h2>2. Manual Notes & Flowcharts</h2>{manual_html}"
-            
-            doc = QTextDocument()
-            doc.setHtml(final_html)
-            doc.print(printer)
-            
-            QDesktopServices.openUrl(QUrl.fromLocalFile(temp_path))
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Could not generate PDF: {str(e)}")
-
     def export_docx(self):
         save_path, _ = QFileDialog.getSaveFileName(self, "Save Word", "Task_Directive_Final.docx", "Word (*.docx)")
         if not save_path: return
@@ -831,20 +793,33 @@ class OfflineApp(QMainWindow):
             doc.add_paragraph("__________________________________________________")
             add_heading(doc, "3. Basis Of Task Directive [Default]")
             doc.add_paragraph("__________________________________________________")
+            
+            # Extract from Combo boxes
+            scope_combo = self.combos.get("Scope Of Task Directive")
+            scope_text = "\n".join(scope_combo.checkedItems()) if scope_combo and scope_combo.checkedItems() else "____"
+            
             add_heading(doc, "4. Scope Of Task Directive [Drop down menu]")
-            doc.add_paragraph("To assign the certification respectively\n1) ____\n2) ____\n3) ____")
+            doc.add_paragraph(f"To assign the certification respectively:\n{scope_text}\n\n1) ____\n2) ____\n3) ____")
 
-            add_heading(doc, "5. Stakeholders [Automated + Manual Notes]")
+            sth_combo = self.combos.get("Stakeholders")
+            sth_text = "\n".join(sth_combo.checkedItems()) if sth_combo and sth_combo.checkedItems() else "Both"
+            
+            add_heading(doc, f"5. Stakeholders [Automated + Manual Notes] ({sth_text})")
             doc.add_paragraph("The following are the major stakeholders and manual notes extracted:")
             doc.add_paragraph(self.manual_input.toPlainText()) 
 
             table = doc.add_table(rows=4, cols=4); table.style = 'Table Grid'
             for i, h in enumerate(["Sl No.", "Organisation", "Role", "Activities"]): table.cell(0, i).text = h
 
+            cert_combo = self.combos.get("Certification Work Breakdown")
+            cert_text = "\n".join(cert_combo.checkedItems()) if cert_combo and cert_combo.checkedItems() else "______________________________________________"
             add_heading(doc, "6. Certification Work Breakdown [Drop down menu]")
-            doc.add_paragraph("______________________________________________")
+            doc.add_paragraph(cert_text)
+            
+            task_combo = self.combos.get("Task Allocation")
+            task_text = "\n".join(task_combo.checkedItems()) if task_combo and task_combo.checkedItems() else "______________________________________________"
             add_heading(doc, "7. Task Allocation [Default]")
-            doc.add_paragraph("______________________________________________")
+            doc.add_paragraph(task_text)
             add_heading(doc, "7.1 Coordinating Directorate [Default]")
             doc.add_paragraph("______________________________________________")
             add_heading(doc, "7.2 Single Point of Contact (SPoC) [Default]")
@@ -859,8 +834,11 @@ class OfflineApp(QMainWindow):
 
             add_heading(doc, "8. SCRB And TARB [Default]")
             doc.add_paragraph("______________________________________________")
+            
+            comm_combo = self.combos.get("Communication Type")
+            comm_text = "\n".join(comm_combo.checkedItems()) if comm_combo and comm_combo.checkedItems() else "______________________________________________"
             add_heading(doc, "9. Communication [Default]")
-            doc.add_paragraph("______________________________________________")
+            doc.add_paragraph(comm_text)
             add_heading(doc, "10. Certification Progress Review [Default]")
             doc.add_paragraph("______________________________________________\n\n(__________)")
 
