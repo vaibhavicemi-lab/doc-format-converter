@@ -1,16 +1,39 @@
 import sys
+import subprocess
 import os
 import re
 import fitz  # PyMuPDF
 import pandas as pd
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QRect, QPoint, QSize, QMarginsF
+from PyQt6.QtPrintSupport import QPrinter
+
+from docx import Document
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_SECTION
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QHBoxLayout, QPushButton, QTextEdit, QFileDialog,
-    QLabel, QSplitter, QMessageBox, QScrollArea, QProgressBar,
-    QCheckBox, QGroupBox, QDialog, QRubberBand, QMenu, QLineEdit,
-    QGridLayout, QFrame, QComboBox, QInputDialog
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QTextEdit, QLineEdit,
+    QFileDialog, QMessageBox, QInputDialog,
+    QDialog, QMenu,
+    QScrollArea, QSplitter,
+    QProgressBar, QSizePolicy,
+    QCheckBox, QGroupBox, QComboBox,
+    QFrame, QRubberBand,
+    QStyleFactory, QTableWidget, QTableWidgetItem
 )
-from PyQt6.QtGui import QPixmap, QImage, QFont, QTextDocument, QTextCursor, QPageLayout, QStandardItemModel, QStandardItem
+from PyQt6.QtGui import (
+    QPixmap, QImage,
+    QCursor, QColor, QPalette,
+    QTextCursor,
+    QStandardItemModel, QStandardItem,
+    QAction, QIcon, QFont,
+    QKeySequence
+)
+
 
 # ==========================================
 # --- CHECKABLE COMBO BOX ---
@@ -21,20 +44,33 @@ class CheckableComboBox(QComboBox):
         self.view().pressed.connect(self.handleItemPressed)
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
+        self._ignore_hide = False
+        self.setModelColumn(0)
+        self.setStyleSheet(
+            "QComboBox QAbstractItemView { background-color: #ffffff; color: #000000; }"
+        )
 
     def handleItemPressed(self, index):
         item = self._model.itemFromIndex(index)
+        if item is None:
+            return
         if item.checkState() == Qt.CheckState.Checked:
             item.setCheckState(Qt.CheckState.Unchecked)
         else:
             item.setCheckState(Qt.CheckState.Checked)
+        self._ignore_hide = True
+        self._model.dataChanged.emit(index, index)
 
     def addItem(self, text, checked=False):
         item = QStandardItem(text)
-        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setFlags(
+            Qt.ItemFlag.ItemIsSelectable |
+            Qt.ItemFlag.ItemIsEnabled |
+            Qt.ItemFlag.ItemIsUserCheckable
+        )
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self._model.appendRow(item)
-        
+
     def addItems(self, texts):
         for text in texts:
             self.addItem(text)
@@ -47,42 +83,43 @@ class CheckableComboBox(QComboBox):
                 checked_items.append(item.text())
         return checked_items
 
+    def hidePopup(self):
+        if self._ignore_hide:
+            self._ignore_hide = False
+            return
+        super().hidePopup()
+
     def currentText(self):
         checked = self.checkedItems()
         return ", ".join(checked) if checked else ""
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QRect, QPoint, QSize, QMarginsF
-from PyQt6.QtPrintSupport import QPrinter
-
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.section import WD_SECTION
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 
 # ==========================================
 # --- PURE PYTHON SUMMARIZER ---
 # ==========================================
 def simple_summarize(text, num_sentences=4):
-    if not text: return ""
+    if not text:
+        return ""
     stop_words = {"the", "is", "in", "and", "to", "of", "a", "for", "on", "with", "as", "by", "this", "that", "it", "are", "be", "or", "an", "at", "from", "which", "will"}
     sentences = re.split(r'(?<=[.!?]) +|\n+', text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
-    if len(sentences) <= num_sentences: return " ".join(sentences)
-        
+    if len(sentences) <= num_sentences:
+        return " ".join(sentences)
+
     words = re.findall(r'\b\w+\b', text.lower())
     freq = {}
     for w in words:
-        if w not in stop_words and not w.isnumeric(): freq[w] = freq.get(w, 0) + 1
-            
+        if w not in stop_words and not w.isnumeric():
+            freq[w] = freq.get(w, 0) + 1
+
     scores = {}
     for i, s in enumerate(sentences):
         score = 0
         s_words = re.findall(r'\b\w+\b', s.lower())
         for w in s_words:
-            if w in freq: score += freq[w]
+            if w in freq:
+                score += freq[w]
         scores[i] = score / max(len(s_words), 1)
-        
+
     top_indices = sorted(sorted(scores, key=scores.get, reverse=True)[:num_sentences])
     return " ".join([sentences[i] for i in top_indices])
 
@@ -91,20 +128,21 @@ def simple_summarize(text, num_sentences=4):
 # ==========================================
 class NotesEditor(QTextEdit):
     def canInsertFromMimeData(self, source):
-        if source.hasImage() or source.hasText(): return True
+        if source.hasImage() or source.hasText():
+            return True
         return super().canInsertFromMimeData(source)
 
     def insertFromMimeData(self, source):
         if source.hasImage():
             clipboard = QApplication.clipboard()
-            image = clipboard.image() 
+            image = clipboard.image()
             if not image.isNull():
                 cursor = self.textCursor()
                 if image.width() > 500:
                     image = image.scaledToWidth(500, Qt.TransformationMode.SmoothTransformation)
                 cursor.insertImage(image)
                 self.insertPlainText("\n")
-                return 
+                return
         if source.hasText():
             self.insertPlainText(source.text())
             return
@@ -114,13 +152,14 @@ class NotesEditor(QTextEdit):
 # --- PURE CODE ANALYSIS WORKER ---
 # ==========================================
 class AnalysisWorker(QThread):
-    finished = pyqtSignal(dict) 
+    finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, text, topics):
+    def __init__(self, text, topics, headings):
         super().__init__()
         self.text = text
         self.topics = topics
+        self.headings = headings
 
     def run(self):
         try:
@@ -134,13 +173,25 @@ class AnalysisWorker(QThread):
             if match:
                 clean_name = match.group(1).strip()
                 if not clean_name.startswith("___"):
-                    results["project_name"] = clean_name[:60] 
+                    results["project_name"] = clean_name[:60]
 
             results["introduction"] = simple_summarize(self.text, num_sentences=4)
 
+            # Use ONLY the headings passed in (from PDF detection), don't do additional text-based detection
+            # This ensures we match topics based on actual PDF structure, not content
+            combined_headings = self.headings if self.headings else []
+
+            # Match topics only if they appear in the detected headings
             for topic in self.topics:
-                if topic.lower() in self.text.lower():
-                    results["found_topics"].append(topic)
+                tlow = topic.lower()
+                for heading in combined_headings:
+                    if not heading:
+                        continue
+                    hlow = heading.lower()
+                    # exact word match or substring match within heading
+                    if re.search(r'\b' + re.escape(tlow) + r'\b', hlow) or tlow in hlow or hlow in tlow:
+                        results["found_topics"].append(topic)
+                        break
 
             if results["introduction"] and "Introduction" not in results["found_topics"]:
                 results["found_topics"].append("Introduction")
@@ -233,6 +284,83 @@ class PdfPageLabel(QLabel):
         self.rubber_band.hide()
 
 # ==========================================
+# --- TABLE EDITOR DIALOG ---
+# ==========================================
+class TableEditorDialog(QDialog):
+    def __init__(self, table_name, headers, rows_data=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit Table: {table_name}")
+        self.setGeometry(100, 100, 800, 500)
+        self.table_name = table_name
+        self.headers = headers
+        self.rows_data = rows_data or [["" for _ in headers] for _ in range(3)]
+        
+        layout = QVBoxLayout(self)
+        
+        # Title
+        title = QLabel(f"<b>Table: {table_name}</b>")
+        layout.addWidget(title)
+        
+        # Table widget
+        self.table_widget = QTableWidget()
+        self.table_widget.setColumnCount(len(headers))
+        self.table_widget.setHorizontalHeaderLabels(headers)
+        self.table_widget.setRowCount(len(self.rows_data))
+        
+        for row_idx, row_data in enumerate(self.rows_data):
+            for col_idx, cell_data in enumerate(row_data):
+                item = QTableWidgetItem(str(cell_data))
+                self.table_widget.setItem(row_idx, col_idx, item)
+        
+        layout.addWidget(self.table_widget)
+        
+        # Button layout
+        btn_layout = QHBoxLayout()
+        
+        add_row_btn = QPushButton("Add Row")
+        add_row_btn.clicked.connect(self.add_row)
+        btn_layout.addWidget(add_row_btn)
+        
+        delete_row_btn = QPushButton("Delete Row")
+        delete_row_btn.clicked.connect(self.delete_row)
+        btn_layout.addWidget(delete_row_btn)
+        
+        btn_layout.addStretch()
+        
+        save_btn = QPushButton("Save & Close")
+        save_btn.setStyleSheet("background-color: #059669; color: white;")
+        save_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(save_btn)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(btn_layout)
+    
+    def add_row(self):
+        row_idx = self.table_widget.rowCount()
+        self.table_widget.insertRow(row_idx)
+        for col_idx in range(len(self.headers)):
+            item = QTableWidgetItem("")
+            self.table_widget.setItem(row_idx, col_idx, item)
+    
+    def delete_row(self):
+        current_row = self.table_widget.currentRow()
+        if current_row >= 0:
+            self.table_widget.removeRow(current_row)
+    
+    def get_table_data(self):
+        data = []
+        for row_idx in range(self.table_widget.rowCount()):
+            row_data = []
+            for col_idx in range(self.table_widget.columnCount()):
+                item = self.table_widget.item(row_idx, col_idx)
+                row_data.append(item.text() if item else "")
+            data.append(row_data)
+        return data
+
+# ==========================================
 # --- MULTI SELECT COMPONENT ---
 # ==========================================
 class MultiSelectWidget(QWidget):
@@ -246,8 +374,13 @@ class MultiSelectWidget(QWidget):
         self.display_box.setReadOnly(True)
         self.display_box.setFixedHeight(65)
         self.display_box.setPlaceholderText("Selected options will appear here...")
-        self.display_box.setStyleSheet("background-color: #f1f5f9; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 6px;")
-        
+        self.display_box.setStyleSheet("""
+            background-color: white;
+            color: #0f172a;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            padding: 8px;
+        """)        
         self.combo = CheckableComboBox()
         clean_opts = [o for o in options if o != "Enter Other..."]
         self.combo.addItems(clean_opts)
@@ -307,7 +440,22 @@ class OfflineApp(QMainWindow):
         self.original_file_path = ""
         
         self.intro_text_data = "" 
+        self.section_notes = {}
+        self.manual_collapsed = False
+        self.manual_section_maximized = False
+
+        # Table data storage: table_name -> list of rows (each row is list of cells)
+        self.table_data = {
+            "5. Stakeholders": [["", "", "", ""]]*3,
+            "7.3 Certification Task Allocation": [["", "", "", ""]]*3,
+            "Annexure-1: Work Assignment List": [["", "", "", "", "", ""]]*3,
+            "Annexure-1: Integration Checks": [["", "", "", "", ""]]*2,
+            "Annexure-2: Contact Details": [["", "", "", "", ""]]*2,
+        }
         
+        # Image storage: heading -> list of QPixmap objects
+        self.section_images = {}
+
         self.apply_stylesheet()
         self.init_ui()
 
@@ -330,7 +478,7 @@ class OfflineApp(QMainWindow):
             QGroupBox { background: transparent; border: none; color: #0f172a; }
             QComboBox { padding: 8px; border-radius: 6px; border: 1px solid #cbd5e1; background-color: #ffffff; color: #000000; }
             QComboBox::drop-down { border: 0px; }
-            QComboBox QAbstractItemView { border: 1px solid #cbd5e1; background-color: #ffffff; color: #000000; selection-background-color: #e2e8f0; selection-color: #000000; }
+            QComboBox QAbstractItemView { border: 1px solid #cbd5e1; background-color: #ffffff; color: #000000; selection-background-color: #e2e8f0; selection-color: #000000; outline: 0; }
             QComboBox QAbstractItemView::item { background-color: #ffffff; color: #000000; padding: 8px; }
             QComboBox QAbstractItemView::item:selected { background-color: #e2e8f0; color: #000000; }
             QSplitter::handle { background-color: #94a3b8; border-radius: 2px; margin: 2px; }
@@ -506,6 +654,7 @@ class OfflineApp(QMainWindow):
         status_main_layout.addLayout(chk_layout)
         status_main_layout.addWidget(topics_scroll)
 
+        self.status_card = status_card
         right_layout.addWidget(status_card)
 
         # Card 2: Manual Data
@@ -516,16 +665,39 @@ class OfflineApp(QMainWindow):
 
         manual_title = QLabel("<h3>Manual Data</h3>")
         manual_title.setProperty("class", "Heading")
-        manual_layout.addWidget(manual_title)
+
+        manual_header_layout = QHBoxLayout()
+        manual_header_layout.addWidget(manual_title)
+        manual_header_layout.addStretch()
+
+        self.manual_collapse_btn = QPushButton("–")
+        self.manual_collapse_btn.setObjectName("ToolBtn")
+        self.manual_collapse_btn.setFixedSize(32, 32)
+        self.manual_collapse_btn.setToolTip("Collapse/Expand Manual Input")
+        self.manual_collapse_btn.clicked.connect(self.toggle_manual_collapse)
+
+        self.manual_section_maximize_btn = QPushButton("🗖")
+        self.manual_section_maximize_btn.setObjectName("ToolBtn")
+        self.manual_section_maximize_btn.setFixedSize(32, 32)
+        self.manual_section_maximize_btn.setToolTip("Maximize/Restore Manual Input")
+        self.manual_section_maximize_btn.clicked.connect(self.toggle_manual_section_maximize)
+
+        manual_header_layout.addWidget(self.manual_collapse_btn)
+        manual_header_layout.addWidget(self.manual_section_maximize_btn)
+        manual_layout.addLayout(manual_header_layout)
+
+        manual_body = QWidget()
+        manual_body_layout = QVBoxLayout(manual_body)
+        manual_body_layout.setContentsMargins(0, 0, 0, 0)
+        manual_body_layout.setSpacing(12)
 
         proj_label = QLabel("Project Name:")
         proj_label.setStyleSheet("font-weight: bold;")
-        manual_layout.addWidget(proj_label)
-        
+        manual_body_layout.addWidget(proj_label)
+
         self.project_name_input = QLineEdit()
         self.project_name_input.setPlaceholderText("Type or paste Project Name here...")
-        
-        manual_layout.addWidget(self.project_name_input)
+        manual_body_layout.addWidget(self.project_name_input)
 
         dropdowns = [
             ("Scope Of Task Directive", ["Option 1", "Option 2", "Option 3", "Enter Other..."]),
@@ -533,32 +705,138 @@ class OfflineApp(QMainWindow):
             ("Certification Work Breakdown", ["Type A", "Type B", "Type C", "Enter Other..."]),
             ("Task Allocation", ["Auto", "Manual", "Hybrid", "Enter Other..."]),
             ("Communication Type", ["Email", "Meeting", "Report", "Enter Other..."])
+            
         ]
-        
+
+        dropdown_card = QFrame()
+        dropdown_card.setStyleSheet("""
+            background: white;
+            border-radius: 12px;
+            border: 1px solid #e2e8f0;
+            padding: 15px;
+        """)
+
+        dropdown_layout = QVBoxLayout(dropdown_card)
+
         self.combos = []
+
         for label, items in dropdowns:
             row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setFixedWidth(200)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-            lbl.setStyleSheet("margin-top: 5px;")
+            row.setSpacing(15)
+            row.setContentsMargins(5, 5, 5, 5)
+
+            lbl = QLabel(label + ":")
+            lbl.setFixedWidth(220)
+            lbl.setStyleSheet("""
+                QLabel {
+                    font-weight: 600;
+                    font-size: 14px;
+                    color: #1e293b;
+                }
+            """)
+
             combo = MultiSelectWidget(items)
+            combo.setStyleSheet("""
+                QTextEdit {
+                    background-color: white;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                    padding: 8px;
+                    font-size: 13px;
+                }
+
+                QComboBox {
+                    background-color: white;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                    padding: 8px;
+                }
+
+                QLineEdit {
+                    border-radius: 8px;
+                    padding: 6px;
+                }
+            """)
+
             row.addWidget(lbl)
             row.addWidget(combo)
-            manual_layout.addLayout(row)
+            dropdown_layout.addLayout(row)
             self.combos.append(combo)
-            
-        self.scope_dropdown, self.stakeholder_dropdown, self.cert_dropdown, self.task_dropdown, self.comm_dropdown = self.combos
+            # Map common dropdown labels to named attributes used in export
+            low = label.lower()
+            if "scope" in low:
+                self.scope_dropdown = combo
+            elif "stakeholder" in low:
+                self.stakeholder_dropdown = combo
+            elif "certification" in low or "certification work" in low:
+                self.cert_dropdown = combo
+            elif "task allocation" in low or low.strip().startswith("task allocation"):
+                self.task_dropdown = combo
+            elif "communication" in low:
+                self.comm_dropdown = combo
 
-        notes_label = QLabel("Manual Notes, Stakeholders, & Other Data:")
-        notes_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        manual_layout.addWidget(notes_label)
+        manual_body_layout.addWidget(dropdown_card)
+
+        self.manual_heading_widget = QWidget()
+        manual_select_layout = QHBoxLayout()
+        self.manual_heading_widget.setLayout(manual_select_layout)
+
+        manual_heading_label = QLabel("Select Heading:")
+        manual_heading_label.setStyleSheet("font-weight: bold;")
+
+        self.manual_heading_dropdown = QComboBox()
+        self.manual_heading_dropdown.addItems([
+            "Introduction",
+            "Reference",
+            "Basis Of Task Directive",
+            "Scope Of Task Directive",
+            "Stakeholders",
+            "Certification Work Breakdown",
+            "Task Allocation",
+            "Communication",
+            "Annexure – 3"
+        ])
+        self.manual_heading_dropdown.currentTextChanged.connect(self.load_section_note)
+        manual_select_layout.addWidget(manual_heading_label)
+        manual_select_layout.addWidget(self.manual_heading_dropdown)
+        manual_body_layout.addWidget(self.manual_heading_widget)
+
+        # Table selector dropdown
+        table_selector_layout = QHBoxLayout()
+        table_selector_label = QLabel("Edit Table:")
+        table_selector_label.setStyleSheet("font-weight: bold;")
         
+        self.table_selector_dropdown = QComboBox()
+        self.table_selector_dropdown.addItem("-- Select a Table --")
+        self.table_selector_dropdown.addItems([
+            "5. Stakeholders",
+            "7.3 Certification Task Allocation",
+            "Annexure-1: Work Assignment List",
+            "Annexure-1: Integration Checks",
+            "Annexure-2: Contact Details"
+        ])
+        self.table_selector_dropdown.currentTextChanged.connect(self.on_table_selected)
+        
+        table_selector_layout.addWidget(table_selector_label)
+        table_selector_layout.addWidget(self.table_selector_dropdown)
+        table_selector_layout.addStretch()
+        manual_body_layout.addLayout(table_selector_layout)
+
+        self.manual_notes_label = QLabel("Manual Notes:")
+        self.manual_notes_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        manual_body_layout.addWidget(self.manual_notes_label)
         self.manual_input = NotesEditor()
-        self.manual_input.setPlaceholderText("Extract Stakeholders, Scope, and flowcharts here...")
-        
-        manual_layout.addWidget(self.manual_input)
+        self.manual_input.setMinimumHeight(260)
+        self.manual_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.manual_input.setPlaceholderText("Extracted contents here...")
+        manual_body_layout.addWidget(self.manual_input)
+        self.manual_input.textChanged.connect(self.save_current_section_note)
 
+        self.manual_project_label = proj_label
+        self.manual_dropdown_card = dropdown_card
+
+        self.manual_body = manual_body
+        manual_layout.addWidget(manual_body)
         right_layout.addWidget(manual_card, stretch=1)
 
         # Card 3: Actions
@@ -597,6 +875,8 @@ class OfflineApp(QMainWindow):
         btn_layout.addWidget(self.preview_pdf_btn)
         actions_layout.addLayout(btn_layout)
 
+        self.actions_card = actions_card
+
         right_layout.addWidget(actions_card)
 
         self.splitter.addWidget(left_container)
@@ -604,6 +884,59 @@ class OfflineApp(QMainWindow):
         self.splitter.setStretchFactor(0, 5) 
         self.splitter.setStretchFactor(1, 5) 
         layout.addWidget(self.splitter)
+
+
+    def detect_pdf_headings(self, pdf_doc):
+        detected_headings = []
+
+        for page in pdf_doc:
+            blocks = page.get_text("dict")["blocks"]
+
+            for block in blocks:
+                if "lines" not in block:
+                    continue
+
+                for line in block["lines"]:
+                    for span in line["spans"]:
+
+                        text = span["text"].strip()
+
+                        if not text:
+                            continue
+
+                        font_size = span["size"]
+                        font_name = span["font"].lower()
+
+                        is_bold = (
+                            "bold" in font_name
+                            or "black" in font_name
+                            or "heavy" in font_name
+                        )
+
+                        # HEADING RULES
+                        if (
+                            font_size >= 13      # Larger than body text
+                            or is_bold           # Bold text
+                        ) and len(text) < 80:    # Avoid paragraphs
+
+                            detected_headings.append(text)
+        
+        # Normalize and deduplicate
+        norm = []
+        seen = set()
+        for h in detected_headings:
+            s = h.strip()
+            if not s or len(s) > 120:
+                continue
+            # collapse whitespace
+            s = re.sub(r"\s+", " ", s)
+            s_lower = s.lower()
+            if s_lower not in seen:
+                norm.append(s)
+                seen.add(s_lower)
+
+        print("Detected Headings:", norm)
+        return norm
 
     # ------------------------------------------
     # --- EDITABLE SUMMARY POPUP ---
@@ -629,12 +962,97 @@ class OfflineApp(QMainWindow):
         layout.addWidget(close_btn)
         dialog.exec()
 
+#--------------Add Save/Load Methods------------------#
+    def load_section_note(self):
+        heading = self.manual_heading_dropdown.currentText()
+
+        # Special handling for Annexure – 3: image-only mode
+        if heading == "Annexure – 3":
+            self.manual_input.blockSignals(True)
+            images = self.section_images.get(heading, [])
+            image_count = len(images)
+            self.manual_input.setPlainText(f"Annexure – 3 (Images only)\n\nNumber of images stored: {image_count}\n\n[Extract images from PDF and they will be added to this section]")
+            self.manual_input.setReadOnly(True)
+            self.manual_input.blockSignals(False)
+        else:
+            self.manual_input.setReadOnly(False)
+            self.manual_input.blockSignals(True)
+            self.manual_input.setPlainText(
+                self.section_notes.get(heading, "")
+            )
+            self.manual_input.blockSignals(False)
+    
+    def save_current_section_note(self):
+        heading = self.manual_heading_dropdown.currentText()
+        
+        # Don't save text for Annexure – 3 (images only)
+        if heading != "Annexure – 3":
+            self.section_notes[heading] = self.manual_input.toPlainText()
+
+    def on_table_selected(self, table_name):
+        """Handle table selection and open editor if a valid table is selected"""
+        if table_name == "-- Select a Table --":
+            return
+        
+        # Define table structures
+        table_configs = {
+            "5. Stakeholders": {
+                "headers": ["Sl No.", "Organisation", "Role", "Activities"],
+                "rows": 3
+            },
+            "7.3 Certification Task Allocation": {
+                "headers": ["Sl No.", "Certification Activity", "Certification Work Centre", "Responsible Head"],
+                "rows": 3
+            },
+            "Annexure-1: Work Assignment List": {
+                "headers": ["Sl No", "ABC", "Abc2", "Abc3", "Abc4", "Abc5"],
+                "rows": 3
+            },
+            "Annexure-1: Integration Checks": {
+                "headers": ["Sl no.", "Abc1", "Abc2", "Abc3", "Abc4"],
+                "rows": 2
+            },
+            "Annexure-2: Contact Details": {
+                "headers": ["Sl no.", "Abc1", "Abc2", "Abc3", "Abc4"],
+                "rows": 2
+            }
+        }
+        
+        if table_name not in table_configs:
+            return
+        
+        config = table_configs[table_name]
+        headers = config["headers"]
+        
+        # Get stored data or create new
+        current_data = self.table_data.get(table_name, [["" for _ in headers] for _ in range(config["rows"])])
+        
+        # Open editor dialog
+        dialog = TableEditorDialog(table_name, headers, current_data, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Save the edited data
+            self.table_data[table_name] = dialog.get_table_data()
+            
+            # Reset dropdown
+            self.table_selector_dropdown.blockSignals(True)
+            self.table_selector_dropdown.setCurrentIndex(0)
+            self.table_selector_dropdown.blockSignals(False)
+            
+            QMessageBox.information(self, "Success", f"Table '{table_name}' saved successfully!")
+        else:
+            # Reset dropdown if cancelled
+            self.table_selector_dropdown.blockSignals(True)
+            self.table_selector_dropdown.setCurrentIndex(0)
+            self.table_selector_dropdown.blockSignals(False)
+
+
     # ------------------------------------------
     # --- AUTO-PASTING FUNCTIONS ---
     # ------------------------------------------
     def add_extracted_text(self, text):
         QApplication.clipboard().setText(text) 
-        self.manual_input.append(text + "\\n")
+        self.manual_input.append(text + "\n")
         
     def add_extracted_image(self, pixmap):
         if pixmap.width() > 500:
@@ -644,7 +1062,13 @@ class OfflineApp(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End) 
         self.manual_input.setTextCursor(cursor)
         cursor.insertImage(pixmap.toImage()) 
-        self.manual_input.append("\\n") 
+        self.manual_input.append("\n")
+        
+        # Store image with current heading
+        current_heading = self.manual_heading_dropdown.currentText()
+        if current_heading not in self.section_images:
+            self.section_images[current_heading] = []
+        self.section_images[current_heading].append(pixmap) 
         
     def generate_summary_from_selection(self, text):
         self.status_label.setText("Summarizing selection...")
@@ -683,6 +1107,22 @@ class OfflineApp(QMainWindow):
             self.right_container.show() 
             self.maximize_btn.setText("🗖") 
             self.is_maximized = False
+
+    def toggle_manual_collapse(self):
+        self.manual_collapsed = not self.manual_collapsed
+        self.manual_input.setVisible(not self.manual_collapsed)
+        self.manual_notes_label.setVisible(not self.manual_collapsed)
+        self.manual_collapse_btn.setText("+" if self.manual_collapsed else "–")
+
+    def toggle_manual_section_maximize(self):
+        if not self.manual_section_maximized:
+            self.manual_input.setMaximumHeight(1000)
+            self.manual_section_maximized = True
+            self.manual_section_maximize_btn.setText("🗗")
+        else:
+            self.manual_input.setMaximumHeight(16777215)
+            self.manual_section_maximized = False
+            self.manual_section_maximize_btn.setText("🗖")
 
     def zoom_in(self, step=150):
         self.current_zoom += step
@@ -799,15 +1239,21 @@ class OfflineApp(QMainWindow):
                 self.check_upload.setChecked(True)
                 
                 full_text = self.text_preview.toPlainText() if not self.doc else "".join(page.get_text() for page in self.doc)
-                self.start_analysis_thread(full_text)
+
+                if self.doc:
+                    detected_headings = self.detect_pdf_headings(self.doc)
+                else:
+                    detected_headings = []
+
+                self.start_analysis_thread(full_text, detected_headings)
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not load file: {str(e)}")
 
-    def start_analysis_thread(self, text):
+    def start_analysis_thread(self, text, headings):
         self.status_label.setText("Scanning document with Python NLP...")
         self.progress_bar.show()
-        self.worker = AnalysisWorker(text, self.topics)
+        self.worker = AnalysisWorker(text, self.topics, headings)
         self.worker.finished.connect(self.handle_analysis_done)
         self.worker.error.connect(lambda e: self.status_label.setText(f"Analysis Error: {e}"))
         self.worker.start()
@@ -831,243 +1277,462 @@ class OfflineApp(QMainWindow):
     # --- TEMPLATE INJECTION & EXPORT ---
     # ------------------------------------------
     def preview_pdf(self):
+
+        if not hasattr(self, "generated_preview_path") or not self.generated_preview_path:
+            QMessageBox.warning(
+                self,
+                "No Preview Available",
+                "Please generate/export the Task Directive first."
+            )
+            return
+
         try:
-            import tempfile
-            import webbrowser
-            
-            doc = QTextDocument()
-            html = "<html><body style='font-family: Calibri, sans-serif; font-size: 14px;'>"
-            
-            p_name = self.project_name_input.text().strip() or "__________________________________________"
-            intro_text = self.intro_text_data.strip() or "__________________________________________________"
-            manual_text = self.manual_input.toPlainText().replace('\\n', '<br>')
-            
-            scope_val = getattr(self, 'scope_dropdown', None)
-            scope_text = "<br>".join(scope_val.checkedItems()) if scope_val and scope_val.checkedItems() else "____"
-            
-            sth_val = getattr(self, 'stakeholder_dropdown', None)
-            sth_text = "<br>".join(sth_val.checkedItems()) if sth_val and sth_val.checkedItems() else "Both"
-            
-            cert_val = getattr(self, 'cert_dropdown', None)
-            cert_text = "<br>".join(cert_val.checkedItems()) if cert_val and cert_val.checkedItems() else "______________________________________________"
-            
-            task_val = getattr(self, 'task_dropdown', None)
-            task_text = "<br>".join(task_val.checkedItems()) if task_val and task_val.checkedItems() else "______________________________________________"
-            
-            comm_val = getattr(self, 'comm_dropdown', None)
-            comm_text = "<br>".join(comm_val.checkedItems()) if comm_val and comm_val.checkedItems() else "______________________________________________"
-            
-            html += f"<h1 style='text-align: center;'>TASK DIRECTIVE</h1>"
-            html += f"<h3 style='text-align: center;'>PROJECT NAME: {p_name}</h3><hr>"
-            
-            html += "<h2>1. Introduction [Automated]</h2>"
-            html += f"<p>{intro_text}</p>"
-            
-            html += "<h2>2. Reference [Default]</h2><p>__________________________________________________</p>"
-            html += "<h2>3. Basis Of Task Directive [Default]</h2><p>__________________________________________________</p>"
-            
-            html += f"<h2>4. Scope Of Task Directive [Drop down menu]</h2>"
-            html += f"<p>To assign the certification respectively:<br>{scope_text}<br><br>1) ____<br>2) ____<br>3) ____</p>"
-            
-            html += f"<h2>5. Stakeholders [Automated + Manual Notes] ({sth_text})</h2>"
-            html += f"<p>The following are the major stakeholders and manual notes extracted:<br>{manual_text}</p>"
-            html += "<table border='1' cellspacing='0' cellpadding='5' width='100%'><tr><th>Sl No.</th><th>Organisation</th><th>Role</th><th>Activities</th></tr><tr><td>&nbsp;</td><td></td><td></td><td></td></tr></table>"
-            
-            html += "<h2>6. Certification Work Breakdown [Drop down menu]</h2>"
-            html += f"<p>{cert_text}</p>"
-            
-            html += "<h2>7. Task Allocation [Default]</h2>"
-            html += f"<p>{task_text}</p>"
-            
-            html += "<h2>9. Communication [Default]</h2>"
-            html += f"<p>{comm_text}</p>"
+            self.file_path = self.generated_preview_path
 
-            html += "</body></html>"
-            
-            doc.setHtml(html)
-            
-            temp_path = os.path.join(tempfile.gettempdir(), "Task_Directive_Preview.pdf")
-            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-            printer.setOutputFileName(temp_path)
-            
-            printer.setPageMargins(QMarginsF(15.0, 15.0, 15.0, 15.0), QPageLayout.Unit.Millimeter) 
-            doc.print(printer)
-            
-            # Load the PDF into the left preview pane exactly as requested
-            try:
-                self.file_path = temp_path
-                self.text_preview.hide()
-                self.scroll_area.show()
-                self.doc = fitz.open(temp_path)
-                
-                self.status_label.setText("Loading PDF Preview Pages...")
-                QApplication.processEvents()
+            self.text_preview.hide()
+            self.scroll_area.show()
 
-                self.page_data.clear()
-                for i, page in enumerate(self.doc):
-                    if i < 15:
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
-                        self.page_data.append((QPixmap.fromImage(img), i))
-                
-                self.current_zoom = 600
-                self.refresh_pdf_view()
-                
-                self.close_preview_btn.show()
-                self.status_label.setText("Preview loaded on the left pane!")
-            except Exception as e:
-                QMessageBox.critical(self, "Preview Load Error", str(e))
-            
+            self.doc = fitz.open(self.generated_preview_path)
+
+            self.status_label.setText("Loading Saved Task Directive Preview...")
+            QApplication.processEvents()
+
+            self.page_data.clear()
+
+            for i, page in enumerate(self.doc):
+
+                if i < 20:
+
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(2.0, 2.0)
+                    )
+
+                    img = QImage(
+                        pix.samples,
+                        pix.width,
+                        pix.height,
+                        pix.stride,
+                        QImage.Format.Format_RGB888
+                    ).copy()
+
+                    self.page_data.append(
+                        (QPixmap.fromImage(img), i)
+                    )
+
+            self.current_zoom = 600
+
+            self.refresh_pdf_view()
+
+            self.close_preview_btn.show()
+
+            self.status_label.setText("Saved Task Directive Preview Loaded!")
+
         except Exception as e:
-            QMessageBox.critical(self, "Preview Error", f"Failed to generate preview:\\n{str(e)}")
+
+            QMessageBox.critical(
+                self,
+                "Preview Error",
+                f"Failed to open saved preview:\n{str(e)}"
+            )
+
+    def inject_images_for_heading(self, doc, heading_name):
+        """Add all images associated with a heading to the document"""
+        images = self.section_images.get(heading_name, [])
+        for pixmap in images:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # Save pixmap temporarily and insert into doc
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                pixmap.save(tmp.name, "PNG")
+                p.add_run().add_picture(tmp.name, width=Inches(4.5))
+            doc.add_paragraph()  # Add blank line after image
 
     def export_docx(self):
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Word", "Task_Directive_Final.docx", "Word (*.docx)")
-        if not save_path: return
-            
+
+        self.save_current_section_note()
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Word",
+            "Task_Directive_Final.docx",
+            "Word (*.docx)"
+        )
+
+        if not save_path:
+            return
+
         try:
+
             def add_page_border(section):
                 sectPr = section._sectPr
                 pgBorders = OxmlElement('w:pgBorders')
                 pgBorders.set(qn('w:offsetFrom'), 'page')
+
                 for side in ['top', 'left', 'bottom', 'right']:
                     border = OxmlElement(f'w:{side}')
-                    border.set(qn('w:val'), 'single'); border.set(qn('w:sz'), '12'); border.set(qn('w:space'), '24'); border.set(qn('w:color'), '000000')
+                    border.set(qn('w:val'), 'single')
+                    border.set(qn('w:sz'), '12')
+                    border.set(qn('w:space'), '24')
+                    border.set(qn('w:color'), '000000')
                     pgBorders.append(border)
+
                 sectPr.append(pgBorders)
 
             def remove_page_border(section):
                 sectPr = section._sectPr
-                for el in sectPr.findall(qn('w:pgBorders')): sectPr.remove(el)
+                for el in sectPr.findall(qn('w:pgBorders')):
+                    sectPr.remove(el)
 
             def add_heading(doc, text):
                 p = doc.add_paragraph()
                 run = p.add_run(text)
-                run.bold = True; run.font.size = Pt(12)
+                run.bold = True
+                run.font.size = Pt(12)
 
             doc = Document()
-            style = doc.styles['Normal']
-            style.font.name = 'Calibri'; style.font.size = Pt(11)
 
-            # --- SECTION 1: COVER PAGE ---
+            style = doc.styles['Normal']
+            style.font.name = 'Calibri'
+            style.font.size = Pt(11)
+
+            # ---------------- COVER PAGE ----------------
             section1 = doc.sections[0]
-            section1.top_margin = Inches(1.5); section1.bottom_margin = Inches(1.5)
-            section1.left_margin = Inches(1.5); section1.right_margin = Inches(1.5)
+
+            section1.top_margin = Inches(1.5)
+            section1.bottom_margin = Inches(1.5)
+            section1.left_margin = Inches(1.5)
+            section1.right_margin = Inches(1.5)
+
             add_page_border(section1)
 
             doc.add_paragraph("File No. ________________________")
+
             p = doc.add_paragraph()
-            run = p.add_run("\\nTASK DIRECTIVE\\n"); run.bold = True; run.font.size = Pt(20)
+            run = p.add_run("\nTASK DIRECTIVE\n")
+            run.bold = True
+            run.font.size = Pt(20)
+
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p = doc.add_paragraph("________ /2026"); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            p = doc.add_paragraph("________ /2026")
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
             table = doc.add_table(rows=1, cols=2)
-            table.cell(0, 0).text = "Issue No."; table.cell(0, 1).text = "Date of Issue:"
+            table.cell(0, 0).text = "Issue No."
+            table.cell(0, 1).text = "Date of Issue:"
 
             p_name = self.project_name_input.text().strip()
+
             if not p_name or p_name.lower() == "not found":
                 p_name = "__________________________________________"
-            doc.add_paragraph(f"\\nPROJECT NAME: {p_name}")
 
-            p = doc.add_paragraph("\\n\\n[ LOGO HERE ]"); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            doc.add_paragraph(f"\nPROJECT NAME: {p_name}")
+
+            p = doc.add_paragraph("\n\n[ LOGO HERE ]")
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
             doc.add_paragraph("ABC Organization").alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph("Address of organization").alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph("Organization details").alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-            # --- SECTION 2: MAIN CONTENT ---
+            # ---------------- MAIN CONTENT ----------------
             section2 = doc.add_section(WD_SECTION.NEW_PAGE)
-            section2.header.is_linked_to_previous = False; section2.footer.is_linked_to_previous = False
-            section2.top_margin = Inches(0.75); section2.bottom_margin = Inches(0.75)
-            section2.left_margin = Inches(0.75); section2.right_margin = Inches(0.75)
+
+            section2.header.is_linked_to_previous = False
+            section2.footer.is_linked_to_previous = False
+
+            section2.top_margin = Inches(0.75)
+            section2.bottom_margin = Inches(0.75)
+            section2.left_margin = Inches(0.75)
+            section2.right_margin = Inches(0.75)
+
             remove_page_border(section2)
 
+            # 1 INTRODUCTION
             add_heading(doc, "1. Introduction [Automated]")
+
             intro_text = self.intro_text_data.strip()
-            if not intro_text: intro_text = "__________________________________________________"
+            if not intro_text:
+                intro_text = "__________________________________________________"
+
             doc.add_paragraph(intro_text)
 
+            note = self.section_notes.get("Introduction", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Introduction
+            self.inject_images_for_heading(doc, "Introduction")
+
+            # 2 REFERENCE
             add_heading(doc, "2. Reference [Default]")
             doc.add_paragraph("__________________________________________________")
-            add_heading(doc, "3. Basis Of Task Directive [Default]")
-            scope_val = getattr(self, 'scope_dropdown', None)
-            scope_text = "\\n".join(scope_val.checkedItems()) if scope_val and scope_val.checkedItems() else "____"
-            add_heading(doc, "4. Scope Of Task Directive [Drop down menu]")
-            doc.add_paragraph(f"To assign the certification respectively:\\n{scope_text}\\n\\n1) ____\\n2) ____\\n3) ____")
 
-            sth_val = getattr(self, 'stakeholder_dropdown', None)
-            sth_text = "\\n".join(sth_val.checkedItems()) if sth_val and sth_val.checkedItems() else "Both"
-            add_heading(doc, f"5. Stakeholders [Automated + Manual Notes] ({sth_text})")
-            doc.add_paragraph("The following are the major stakeholders and manual notes extracted:")
-            doc.add_paragraph(self.manual_input.toPlainText()) 
-
-            table = doc.add_table(rows=4, cols=4); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl No.", "Organisation", "Role", "Activities"]): table.cell(0, i).text = h
-
-            cert_val = getattr(self, 'cert_dropdown', None)
-            cert_text = "\\n".join(cert_val.checkedItems()) if cert_val and cert_val.checkedItems() else "______________________________________________"
-            add_heading(doc, "6. Certification Work Breakdown [Drop down menu]")
-            doc.add_paragraph(cert_text)
+            note = self.section_notes.get("Reference", "")
+            if note.strip():
+                doc.add_paragraph(note)
             
+            # Inject images for Reference
+            self.inject_images_for_heading(doc, "Reference")
+
+            # 3 BASIS
+            add_heading(doc, "3. Basis Of Task Directive [Default]")
+            note = self.section_notes.get("Basis Of Task Directive", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Basis Of Task Directive
+            self.inject_images_for_heading(doc, "Basis Of Task Directive")
+
+            # 4 SCOPE
+            scope_val = getattr(self, 'scope_dropdown', None)
+
+            scope_text = "\n".join(scope_val.checkedItems()) if scope_val and scope_val.checkedItems() else "____"
+
+            add_heading(doc, "4. Scope Of Task Directive [Drop down menu]")
+
+            doc.add_paragraph(
+                f"To assign the certification respectively:\n{scope_text}\n\n1) ____\n2) ____\n3) ____"
+            )
+
+            note = self.section_notes.get("Scope Of Task Directive", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Scope Of Task Directive
+            self.inject_images_for_heading(doc, "Scope Of Task Directive")
+
+            # 5 STAKEHOLDERS
+            sth_val = getattr(self, 'stakeholder_dropdown', None)
+
+            sth_text = "\n".join(sth_val.checkedItems()) if sth_val and sth_val.checkedItems() else "Both"
+
+            add_heading(doc, f"5. Stakeholders [Automated + Manual Notes] ({sth_text})")
+
+            doc.add_paragraph("The following are the major stakeholders and manual notes extracted:")
+
+            note = self.section_notes.get("Stakeholders", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Stakeholders
+            self.inject_images_for_heading(doc, "Stakeholders")
+
+            table = doc.add_table(rows=4, cols=4)
+            table.style = 'Table Grid'
+
+            headers = ["Sl No.", "Organisation", "Role", "Activities"]
+            for i, h in enumerate(headers):
+                table.cell(0, i).text = h
+            
+            # Add stored table data
+            table_data = self.table_data.get("5. Stakeholders", [["" for _ in headers] for _ in range(3)])
+            for row_idx, row_data in enumerate(table_data):
+                for col_idx, cell_data in enumerate(row_data):
+                    if row_idx + 1 < table.rows.__len__():  # +1 because row 0 is header
+                        table.cell(row_idx + 1, col_idx).text = str(cell_data)
+
+            # 6 CERTIFICATION
+            cert_val = getattr(self, 'cert_dropdown', None)
+
+            cert_text = "\n".join(cert_val.checkedItems()) if cert_val and cert_val.checkedItems() else "______________________________________________"
+
+            add_heading(doc, "6. Certification Work Breakdown [Drop down menu]")
+
+            doc.add_paragraph(cert_text)
+
+            note = self.section_notes.get("Certification Work Breakdown", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Certification Work Breakdown
+            self.inject_images_for_heading(doc, "Certification Work Breakdown")
+
+            # 7 TASK ALLOCATION
             task_val = getattr(self, 'task_dropdown', None)
-            task_text = "\\n".join(task_val.checkedItems()) if task_val and task_val.checkedItems() else "______________________________________________"
+
+            task_text = "\n".join(task_val.checkedItems()) if task_val and task_val.checkedItems() else "______________________________________________"
+
             add_heading(doc, "7. Task Allocation [Default]")
             doc.add_paragraph(task_text)
+
+            note = self.section_notes.get("Task Allocation", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Task Allocation
+            self.inject_images_for_heading(doc, "Task Allocation")
+
             add_heading(doc, "7.1 Coordinating Directorate [Default]")
             doc.add_paragraph("______________________________________________")
+
             add_heading(doc, "7.2 Single Point of Contact (SPoC) [Default]")
             doc.add_paragraph("______________________________________________")
 
             add_heading(doc, "7.3 Certification Task Allocation")
-            table = doc.add_table(rows=4, cols=4); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl No.", "Certification Activity", "Certification Work Centre", "Responsible Head"]): table.cell(0, i).text = h
+
+            table = doc.add_table(rows=4, cols=4)
+            table.style = 'Table Grid'
+
+            headers = [
+                "Sl No.",
+                "Certification Activity",
+                "Certification Work Centre",
+                "Responsible Head"
+            ]
+            for i, h in enumerate(headers):
+                table.cell(0, i).text = h
+            
+            # Add stored table data
+            table_data = self.table_data.get("7.3 Certification Task Allocation", [["" for _ in headers] for _ in range(3)])
+            for row_idx, row_data in enumerate(table_data):
+                for col_idx, cell_data in enumerate(row_data):
+                    if row_idx + 1 < len(table.rows):
+                        table.cell(row_idx + 1, col_idx).text = str(cell_data)
 
             add_heading(doc, "7.4 Issue of Clearance [Default]")
-            doc.add_paragraph("a. ___\\nb. ___\\nc. ___\\nd. ___\\ne. ___\\nf. ___\\ng. ___")
+            doc.add_paragraph("a. ___\nb. ___\nc. ___\nd. ___\ne. ___\nf. ___\ng. ___")
 
+            # 8 SCRB
             add_heading(doc, "8. SCRB And TARB [Default]")
             doc.add_paragraph("______________________________________________")
-            
+
+            # 9 COMMUNICATION
             comm_val = getattr(self, 'comm_dropdown', None)
-            comm_text = "\\n".join(comm_val.checkedItems()) if comm_val and comm_val.checkedItems() else "______________________________________________"
+
+            comm_text = "\n".join(comm_val.checkedItems()) if comm_val and comm_val.checkedItems() else "______________________________________________"
+
             add_heading(doc, "9. Communication [Default]")
             doc.add_paragraph(comm_text)
+
+            note = self.section_notes.get("Communication", "")
+            if note.strip():
+                doc.add_paragraph(note)
+            
+            # Inject images for Communication
+            self.inject_images_for_heading(doc, "Communication")
+
+            # 10 PROGRESS
             add_heading(doc, "10. Certification Progress Review [Default]")
-            doc.add_paragraph("______________________________________________\\n\\n(__________)")
+            doc.add_paragraph("______________________________________________\n\n(__________)")
 
+            # 11 DISTRIBUTION
             add_heading(doc, "11. Distribution List")
-            doc.add_paragraph("11.1 External Organization\\n1. ___\\n2. ___\\n3. ___\\n11.2 Internal Distribution")
+            doc.add_paragraph(
+                "11.1 External Organization\n1. ___\n2. ___\n3. ___\n11.2 Internal Distribution"
+            )
 
-            # --- ANNEXURES ---
+            # ---------------- ANNEXURES ----------------
             doc.add_page_break()
+
             add_heading(doc, "Annexure-1")
             doc.add_paragraph("Work Assignment List of LRUs [Automate + Manual]")
-            table = doc.add_table(rows=4, cols=6); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl No", "ABC", "Abc2", "Abc3", "Abc4", "Abc5"]): table.cell(0, i).text = h
+
+            table = doc.add_table(rows=4, cols=6)
+            table.style = 'Table Grid'
+
+            headers = ["Sl No", "ABC", "Abc2", "Abc3", "Abc4", "Abc5"]
+            for i, h in enumerate(headers):
+                table.cell(0, i).text = h
+            
+            # Add stored table data
+            table_data = self.table_data.get("Annexure-1: Work Assignment List", [["" for _ in headers] for _ in range(3)])
+            for row_idx, row_data in enumerate(table_data):
+                for col_idx, cell_data in enumerate(row_data):
+                    if row_idx + 1 < len(table.rows):
+                        table.cell(row_idx + 1, col_idx).text = str(cell_data)
 
             doc.add_page_break()
+
             add_heading(doc, "Integration Checks and Clearance [Manual]")
-            table = doc.add_table(rows=3, cols=5); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl no.", "Abc1", "Abc2", "Abc3", "Abc4"]): table.cell(0, i).text = h
+
+            table = doc.add_table(rows=3, cols=5)
+            table.style = 'Table Grid'
+
+            headers = ["Sl no.", "Abc1", "Abc2", "Abc3", "Abc4"]
+            for i, h in enumerate(headers):
+                table.cell(0, i).text = h
+            
+            # Add stored table data
+            table_data = self.table_data.get("Annexure-1: Integration Checks", [["" for _ in headers] for _ in range(2)])
+            for row_idx, row_data in enumerate(table_data):
+                for col_idx, cell_data in enumerate(row_data):
+                    if row_idx + 1 < len(table.rows):
+                        table.cell(row_idx + 1, col_idx).text = str(cell_data)
 
             doc.add_page_break()
+
             add_heading(doc, "Annexure-2")
             doc.add_paragraph("Contact details of dealing officers and RDs [Manual]")
-            table = doc.add_table(rows=3, cols=5); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl no.", "Abc1", "Abc2", "Abc3", "Abc4"]): table.cell(0, i).text = h
+
+            table = doc.add_table(rows=3, cols=5)
+            table.style = 'Table Grid'
+
+            headers = ["Sl no.", "Abc1", "Abc2", "Abc3", "Abc4"]
+            for i, h in enumerate(headers):
+                table.cell(0, i).text = h
+            
+            # Add stored table data
+            table_data = self.table_data.get("Annexure-2: Contact Details", [["" for _ in headers] for _ in range(2)])
+            for row_idx, row_data in enumerate(table_data):
+                for col_idx, cell_data in enumerate(row_data):
+                    if row_idx + 1 < len(table.rows):
+                        table.cell(row_idx + 1, col_idx).text = str(cell_data)
 
             doc.add_page_break()
+
             add_heading(doc, "Annexure-3")
             doc.add_paragraph("Product Break Down Structure [Automate]")
+            
+            # Inject images for Annexure – 3 (images only, no text)
+            self.inject_images_for_heading(doc, "Annexure – 3")
 
             doc.save(save_path)
-            QMessageBox.information(self, "Success", "Task Directive Template created successfully!")
+        
+            pdf_path = save_path.replace(".docx", ".pdf")
+
+            subprocess.run([
+                "libreoffice",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                save_path,
+                "--outdir",
+                os.path.dirname(save_path)
+            ])
+
+            self.generated_preview_path = pdf_path
+            
+            
+            QMessageBox.information(
+                self,
+                "Success",
+                "Task Directive Template created successfully!"
+            )
+            self.preview_pdf()
 
         except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to build template: {str(e)}")
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Failed to build template: {str(e)}"
+            )
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    app.setStyle(QStyleFactory.create("Fusion"))
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#e2e8f0"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    app.setPalette(palette)
+
     window = OfflineApp()
     window.show()
+
     sys.exit(app.exec())
