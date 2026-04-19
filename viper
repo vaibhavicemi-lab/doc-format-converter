@@ -9,19 +9,334 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QPushButton, QTextEdit, QFileDialog,
     QLabel, QSplitter, QMessageBox, QScrollArea, QProgressBar,
     QCheckBox, QGroupBox, QDialog, QRubberBand, QMenu, QLineEdit,
-    QGridLayout, QListWidget, QListWidgetItem
+    QGridLayout, QFrame, QListWidget, QListWidgetItem, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox, QTabWidget
 )
-from PyQt6.QtGui import QPixmap, QImage, QFont, QTextDocument, QTextCursor, QDesktopServices 
+from PyQt6.QtGui import (
+    QPixmap, QImage, QFont, QTextDocument, QTextCursor, 
+    QDesktopServices, QStandardItemModel, QStandardItem, QCursor
+)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QRect, QPoint, QSize, QUrl 
 from PyQt6.QtPrintSupport import QPrinter
 
-# --- WORD TEMPLATE IMPORTS ---
+# --- NATIVE PDF VIEWER IMPORTS ---
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
+    HAS_WEBENGINE = True
+
+    # --- CUSTOM WEB ENGINE VIEW FOR RIGHT-CLICK COPY ---
+    class PDFWebEngineView(QWebEngineView):
+        def contextMenuEvent(self, event):
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu { background-color: #ffffff; border: 1px solid #ced4da; border-radius: 4px; padding: 4px; font-size: 13px; color: #212529; }
+                QMenu::item { padding: 6px 25px 6px 20px; background-color: transparent; }
+                QMenu::item:selected { background-color: #f8f9fa; border-radius: 3px; color: #0d6efd; font-weight: bold;}
+            """)
+            
+            # Force the Copy Action
+            copy_action = menu.addAction("📋 Copy Selected Text")
+            copy_action.triggered.connect(lambda: self.triggerPageAction(QWebEnginePage.WebAction.Copy))
+            
+            menu.addSeparator()
+            
+            reload_action = menu.addAction("🔄 Reload PDF")
+            reload_action.triggered.connect(self.reload)
+
+            menu.exec(event.globalPos())
+
+except ImportError:
+    HAS_WEBENGINE = False
+
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.section import WD_SECTION
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+
+# ==========================================
+# --- INTERNAL PDF VIEWER DIALOG ---
+# ==========================================
+class PDFViewerDialog(QDialog):
+    def __init__(self, pdf_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📄 Generated PDF Preview")
+        self.resize(1000, 800)
+        self.setStyleSheet("""
+            QDialog { background-color: #f8f9fa; }
+            QPushButton#CloseBtn { background-color: #6c757d; color: white; font-size: 14px; font-weight: bold; border-radius: 6px; padding: 10px 30px; border: none; }
+            QPushButton#CloseBtn:hover { background-color: #5a6268; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+        
+        if HAS_WEBENGINE:
+            self.viewer = QWebEngineView()
+            self.viewer.settings().setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+            self.viewer.settings().setAttribute(QWebEngineSettings.WebAttribute.PdfViewerEnabled, True)
+            self.viewer.setUrl(QUrl.fromLocalFile(os.path.abspath(pdf_path)))
+            self.viewer.setStyleSheet("border: 1px solid #dee2e6; border-radius: 6px;")
+            layout.addWidget(self.viewer)
+        else:
+            self.scroll = QScrollArea()
+            self.scroll.setWidgetResizable(True)
+            self.scroll.setStyleSheet("background: #e9ecef; border: 1px solid #ced4da; border-radius: 6px;")
+            self.container = QWidget()
+            self.container.setStyleSheet("background: transparent;")
+            self.vbox = QVBoxLayout(self.container)
+            self.vbox.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            self.scroll.setWidget(self.container)
+            layout.addWidget(self.scroll)
+            
+            try:
+                doc = fitz.open(pdf_path)
+                for page in doc:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                    img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+                    lbl = QLabel()
+                    lbl.setPixmap(QPixmap.fromImage(img))
+                    lbl.setStyleSheet("border: 1px solid #adb5bd; margin: 10px; background: white;")
+                    self.vbox.addWidget(lbl)
+            except Exception as e:
+                err_lbl = QLabel(f"Failed to load PDF preview:\n{e}")
+                err_lbl.setStyleSheet("color: red; font-weight: bold; font-size: 14px;")
+                self.vbox.addWidget(err_lbl)
+
+        close_btn = QPushButton("Close Preview")
+        close_btn.setObjectName("CloseBtn")
+        close_btn.clicked.connect(self.accept)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(close_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+
+# ==========================================
+# --- UNIFIED PROJECT TABLES BUILDER ---
+# ==========================================
+class ProjectTablesDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.setWindowTitle("🗂️ Project Tables Builder")
+        self.resize(850, 500)
+        self.setStyleSheet("""
+            QDialog { background: #f8f9fa; }
+            QLabel { font-weight: bold; color: #212529; font-size: 13px;}
+            QLineEdit, QComboBox { background: #ffffff; color: #212529; border: 1px solid #ced4da; border-radius: 4px; padding: 6px; }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #0d6efd; }
+            QTableWidget { background: #ffffff; alternate-background-color: #f8f9fa; border: 1px solid #ced4da; border-radius: 4px; }
+            QHeaderView::section { background-color: #f1f3f5; font-weight: bold; border: 1px solid #ced4da; padding: 4px; color: #212529; }
+            
+            /* Tab Styling */
+            QTabWidget::pane { border: 1px solid #dee2e6; border-radius: 4px; background: white; top: -1px; }
+            QTabBar::tab { background: #f8f9fa; color: #6c757d; padding: 10px 20px; border: 1px solid #dee2e6; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; font-weight: bold;}
+            QTabBar::tab:selected { background: white; color: #0d6efd; border-top: 3px solid #0d6efd; border-bottom-color: white; }
+            
+            /* Button Styling */
+            QPushButton#BlueBtn { background-color: #0d6efd; color: #ffffff; border: none; padding: 8px 15px; border-radius: 4px; font-weight: bold; font-size: 13px;}
+            QPushButton#BlueBtn:hover { background-color: #0b5ed7; }
+            QPushButton#RedBtn { background-color: #dc3545; color: #ffffff; border: none; padding: 8px 15px; border-radius: 4px; font-weight: bold; font-size: 13px;}
+            QPushButton#RedBtn:hover { background-color: #bb2d3b; }
+            QPushButton#SaveCloseBtn { background-color: #0d6efd; color: white; font-size: 14px; font-weight: bold; border-radius: 6px; border: none; }
+            QPushButton#SaveCloseBtn:hover { background-color: #0b5ed7; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        self.tabs = QTabWidget()
+
+        # ---------------------------------------------------------
+        # TAB 1: STAKEHOLDERS TABLE
+        # ---------------------------------------------------------
+        tab_sh = QWidget()
+        tab_sh.setStyleSheet("background: white;")
+        layout_sh = QVBoxLayout(tab_sh)
+
+        input_layout_sh = QHBoxLayout()
+        self.org_combo = QComboBox()
+        self.org_combo.setEditable(True) 
+        self.org_combo.addItems(["CEMILAC", "RCMA", "DGAQA", "DRDO", "User", "Production Agency"])
+        
+        self.role_input = QLineEdit()
+        self.role_input.setPlaceholderText("e.g. Certification Authority")
+        
+        self.act_input = QLineEdit()
+        self.act_input.setPlaceholderText("e.g. Review & Approval")
+
+        self.add_btn_sh = QPushButton("Add Row")
+        self.add_btn_sh.setObjectName("BlueBtn")
+        self.add_btn_sh.clicked.connect(self.add_stakeholder)
+
+        input_layout_sh.addWidget(QLabel("Organisation:"))
+        input_layout_sh.addWidget(self.org_combo, stretch=2)
+        input_layout_sh.addWidget(QLabel("Role:"))
+        input_layout_sh.addWidget(self.role_input, stretch=2)
+        input_layout_sh.addWidget(QLabel("Activities:"))
+        input_layout_sh.addWidget(self.act_input, stretch=3)
+        input_layout_sh.addWidget(self.add_btn_sh)
+        layout_sh.addLayout(input_layout_sh)
+
+        self.table_sh = QTableWidget(0, 4)
+        self.table_sh.setHorizontalHeaderLabels(["Sl No.", "Organisation", "Role", "Activities"])
+        self.table_sh.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_sh.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) 
+        self.table_sh.setAlternatingRowColors(True)
+        self.table_sh.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_sh.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        layout_sh.addWidget(self.table_sh)
+
+        btn_layout_sh = QHBoxLayout()
+        self.del_btn_sh = QPushButton("Delete Selected Row")
+        self.del_btn_sh.setObjectName("RedBtn")
+        self.del_btn_sh.clicked.connect(self.delete_selected_sh)
+        
+        self.clear_btn_sh = QPushButton("Clear All")
+        self.clear_btn_sh.setObjectName("RedBtn")
+        self.clear_btn_sh.clicked.connect(self.clear_all_sh)
+        
+        btn_layout_sh.addWidget(self.del_btn_sh)
+        btn_layout_sh.addWidget(self.clear_btn_sh)
+        btn_layout_sh.addStretch()
+        layout_sh.addLayout(btn_layout_sh)
+
+        self.tabs.addTab(tab_sh, "👥 Stakeholders Table")
+
+        # ---------------------------------------------------------
+        # TAB 2: CERTIFICATION TASK ALLOCATION TABLE
+        # ---------------------------------------------------------
+        tab_ct = QWidget()
+        tab_ct.setStyleSheet("background: white;")
+        layout_ct = QVBoxLayout(tab_ct)
+
+        input_layout_ct = QHBoxLayout()
+        
+        self.act_input_ct = QLineEdit()
+        self.act_input_ct.setPlaceholderText("e.g. Ground Testing")
+        
+        self.centre_combo = QComboBox()
+        self.centre_combo.setEditable(True) 
+        self.centre_combo.addItems(["CEMILAC", "RCMA", "DGAQA", "DRDO", "User", "Production Agency"])
+        
+        self.head_input = QLineEdit()
+        self.head_input.setPlaceholderText("e.g. Director, RCMA")
+
+        self.add_btn_ct = QPushButton("Add Row")
+        self.add_btn_ct.setObjectName("BlueBtn")
+        self.add_btn_ct.clicked.connect(self.add_task)
+
+        input_layout_ct.addWidget(QLabel("Activity:"))
+        input_layout_ct.addWidget(self.act_input_ct, stretch=2)
+        input_layout_ct.addWidget(QLabel("Work Centre:"))
+        input_layout_ct.addWidget(self.centre_combo, stretch=2)
+        input_layout_ct.addWidget(QLabel("Resp. Head:"))
+        input_layout_ct.addWidget(self.head_input, stretch=2)
+        input_layout_ct.addWidget(self.add_btn_ct)
+        layout_ct.addLayout(input_layout_ct)
+
+        self.table_ct = QTableWidget(0, 4)
+        self.table_ct.setHorizontalHeaderLabels(["Sl No.", "Certification Activity", "Certification Work Centre", "Responsible Head"])
+        self.table_ct.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_ct.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) 
+        self.table_ct.setAlternatingRowColors(True)
+        self.table_ct.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_ct.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        layout_ct.addWidget(self.table_ct)
+
+        btn_layout_ct = QHBoxLayout()
+        self.del_btn_ct = QPushButton("Delete Selected Row")
+        self.del_btn_ct.setObjectName("RedBtn")
+        self.del_btn_ct.clicked.connect(self.delete_selected_ct)
+        
+        self.clear_btn_ct = QPushButton("Clear All")
+        self.clear_btn_ct.setObjectName("RedBtn")
+        self.clear_btn_ct.clicked.connect(self.clear_all_ct)
+
+        btn_layout_ct.addWidget(self.del_btn_ct)
+        btn_layout_ct.addWidget(self.clear_btn_ct)
+        btn_layout_ct.addStretch()
+        layout_ct.addLayout(btn_layout_ct)
+
+        self.tabs.addTab(tab_ct, "🛠️ Cert Task Allocation Table")
+
+        # ---------------------------------------------------------
+        # MAIN DIALOG BUTTONS
+        # ---------------------------------------------------------
+        layout.addWidget(self.tabs)
+        
+        self.close_btn = QPushButton("Save & Close")
+        self.close_btn.setObjectName("SaveCloseBtn")
+        self.close_btn.setFixedHeight(40)
+        self.close_btn.clicked.connect(self.accept)
+        layout.addWidget(self.close_btn)
+
+        self.refresh_sh_table()
+        self.refresh_ct_table()
+
+    # --- Stakeholder Methods ---
+    def add_stakeholder(self):
+        org = self.org_combo.currentText().strip()
+        role = self.role_input.text().strip()
+        act = self.act_input.text().strip()
+        if org:
+            self.parent_app.stakeholders_data.append({"org": org, "role": role, "activities": act})
+            self.role_input.clear()
+            self.act_input.clear()
+            self.refresh_sh_table()
+
+    def delete_selected_sh(self):
+        selected = self.table_sh.currentRow()
+        if selected >= 0:
+            self.parent_app.stakeholders_data.pop(selected)
+            self.refresh_sh_table()
+
+    def clear_all_sh(self):
+        self.parent_app.stakeholders_data.clear()
+        self.refresh_sh_table()
+
+    def refresh_sh_table(self):
+        self.table_sh.setRowCount(0)
+        for i, data in enumerate(self.parent_app.stakeholders_data):
+            self.table_sh.insertRow(i)
+            self.table_sh.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self.table_sh.setItem(i, 1, QTableWidgetItem(data['org']))
+            self.table_sh.setItem(i, 2, QTableWidgetItem(data['role']))
+            self.table_sh.setItem(i, 3, QTableWidgetItem(data['activities']))
+
+    # --- Cert Task Methods ---
+    def add_task(self):
+        act = self.act_input_ct.text().strip()
+        centre = self.centre_combo.currentText().strip()
+        head = self.head_input.text().strip()
+        if act or centre:
+            self.parent_app.cert_task_data.append({"activity": act, "centre": centre, "head": head})
+            self.act_input_ct.clear()
+            self.head_input.clear()
+            self.refresh_ct_table()
+
+    def delete_selected_ct(self):
+        selected = self.table_ct.currentRow()
+        if selected >= 0:
+            self.parent_app.cert_task_data.pop(selected)
+            self.refresh_ct_table()
+
+    def clear_all_ct(self):
+        self.parent_app.cert_task_data.clear()
+        self.refresh_ct_table()
+
+    def refresh_ct_table(self):
+        self.table_ct.setRowCount(0)
+        for i, data in enumerate(self.parent_app.cert_task_data):
+            self.table_ct.insertRow(i)
+            self.table_ct.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self.table_ct.setItem(i, 1, QTableWidgetItem(data['activity']))
+            self.table_ct.setItem(i, 2, QTableWidgetItem(data['centre']))
+            self.table_ct.setItem(i, 3, QTableWidgetItem(data['head']))
 
 
 # ==========================================
@@ -32,47 +347,55 @@ class DropdownPopup(QDialog):
         super().__init__(parent_btn, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.parent_btn = parent_btn
         self.setStyleSheet("""
-            QDialog { background: #FFFFFF; border: 1px solid #ced4da; border-radius: 4px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            QLabel { color: #6B7280; font-size: 11px; font-weight: bold; }
-            QListWidget { background: transparent; border: none; color: #111827; outline: none; font-size: 13px; }
-            QListWidget::item { padding: 6px; border-radius: 4px; }
-            QListWidget::item:hover { background: #F3F4F6; }
-            QLineEdit { background: #FFFFFF; color: #111827; border: 1px solid #2b579a; border-radius: 4px; padding: 4px; }
+            QDialog { background: #ffffff; border: 1px solid #ced4da; border-radius: 6px; }
+            QLabel { color: #6c757d; font-size: 11px; font-weight: bold; }
+            QListWidget { background: transparent; border: none; color: #212529; outline: none; font-size: 13px; }
+            QListWidget::item { padding: 6px; border-radius: 4px; color: #212529; }
+            QListWidget::item:hover { background: #f8f9fa; color: #212529; }
+            QListWidget::item:selected { background: #e9ecef; color: #212529; }
+            QListWidget::indicator { width: 16px; height: 16px; border: 1px solid #ced4da; border-radius: 4px; background: #ffffff; }
+            QListWidget::indicator:checked { background: #0d6efd; border: 1px solid #0d6efd; }
+            QLineEdit { background: #ffffff; color: #212529; border: 1px solid #0d6efd; border-radius: 4px; padding: 4px; }
         """)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        # Header: Title + Add Button
         header_layout = QHBoxLayout()
         header_layout.addWidget(QLabel("SELECT OPTIONS"))
         header_layout.addStretch()
         
-        self.add_btn = QPushButton("+")
-        self.add_btn.setFixedSize(22, 22)
+        self.add_btn = QPushButton("Add")
+        self.add_btn.setFixedSize(40, 24)
         self.add_btn.setStyleSheet("""
-            QPushButton { background: #F3F4F6; color: #111827; border: 1px solid #D1D5DB; border-radius: 4px; font-weight: bold; font-size: 14px; }
-            QPushButton:hover { background: #E5E7EB; }
+            QPushButton { background: #f8f9fa; color: #212529; border: 1px solid #ced4da; border-radius: 4px; font-weight: bold; font-size: 12px; }
+            QPushButton:hover { background: #e9ecef; }
         """)
         self.add_btn.clicked.connect(self.show_new_input)
         header_layout.addWidget(self.add_btn)
         layout.addLayout(header_layout)
 
-        # Hidden Input for new items
         self.new_input = QLineEdit()
-        self.new_input.setPlaceholderText("Type & press Enter...")
+        self.new_input.setPlaceholderText("") 
         self.new_input.hide()
         self.new_input.returnPressed.connect(self.save_new_option)
         layout.addWidget(self.new_input)
 
-        # List of Checkboxes
         self.list_widget = QListWidget()
         for opt in options:
             if opt != "Enter Other...":
                 self.add_item(opt)
+                
+        self.list_widget.itemPressed.connect(self.on_item_pressed)
         self.list_widget.itemChanged.connect(self.parent_btn.update_display)
         layout.addWidget(self.list_widget)
+
+    def on_item_pressed(self, item):
+        pos = self.list_widget.viewport().mapFromGlobal(QCursor.pos())
+        if pos.x() > 25:
+            state = item.checkState()
+            item.setCheckState(Qt.CheckState.Unchecked if state == Qt.CheckState.Checked else Qt.CheckState.Checked)
 
     def add_item(self, text, checked=False):
         item = QListWidgetItem(text)
@@ -103,10 +426,10 @@ class PopupMultiSelect(QPushButton):
         super().__init__("Select options...", parent)
         self.setStyleSheet("""
             QPushButton {
-                text-align: left; padding: 8px; background: #FFFFFF; 
-                border: 1px solid #ced4da; border-radius: 4px; color: #111827; font-size: 13px;
+                text-align: left; padding: 10px; background: #ffffff; 
+                border: 1px solid #ced4da; border-radius: 6px; color: #212529; font-size: 13px;
             }
-            QPushButton:hover { border: 1px solid #2b579a; }
+            QPushButton:hover { border: 1px solid #0d6efd; }
         """)
         self.options = options
         self.popup = None
@@ -137,30 +460,80 @@ class PopupMultiSelect(QPushButton):
                 items.append(item.text())
         return items
 
+# ==========================================
+# --- CUSTOM UI: COLLAPSIBLE PANEL ---
+# ==========================================
+class CollapsibleBox(QWidget):
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        self.toggle_btn = QPushButton(f"▼  {title}")
+        self.toggle_btn.setStyleSheet("""
+            QPushButton {
+                text-align: left; font-weight: bold; background: #f8f9fa; 
+                color: #0d6efd; padding: 12px; font-size: 14px; 
+                border-top-left-radius: 8px; border-top-right-radius: 8px;
+                border: 1px solid #dee2e6; border-bottom: none;
+            }
+            QPushButton:hover { background: #e9ecef; }
+        """)
+        self.toggle_btn.clicked.connect(self.on_press)
+        self.layout.addWidget(self.toggle_btn)
+
+        self.content_area = QFrame()
+        self.content_area.setStyleSheet("""
+            QFrame { background: #ffffff; border: 1px solid #dee2e6; 
+            border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; }
+        """)
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(15, 15, 15, 15)
+        self.content_layout.setSpacing(15)
+        self.layout.addWidget(self.content_area)
+        
+        self.is_expanded = True
+
+    def on_press(self):
+        self.is_expanded = not self.is_expanded
+        if self.is_expanded:
+            self.toggle_btn.setText(self.toggle_btn.text().replace("▶", "▼"))
+            self.toggle_btn.setStyleSheet(self.toggle_btn.styleSheet().replace("border-radius: 8px;", "border-top-left-radius: 8px; border-top-right-radius: 8px;"))
+            self.content_area.show()
+        else:
+            self.toggle_btn.setText(self.toggle_btn.text().replace("▼", "▶"))
+            self.toggle_btn.setStyleSheet(self.toggle_btn.styleSheet().replace("border-top-left-radius: 8px; border-top-right-radius: 8px;", "border-radius: 8px; border-bottom: 1px solid #dee2e6;"))
+            self.content_area.hide()
 
 # ==========================================
 # --- PURE PYTHON SUMMARIZER ---
 # ==========================================
-def simple_summarize(text, num_sentences=4):
-    if not text: return ""
-    stop_words = {"the", "is", "in", "and", "to", "of", "a", "for", "on", "with", "as", "by", "this", "that", "it", "are", "be", "or", "an", "at", "from", "which", "will"}
-    sentences = re.split(r'(?<=[.!?]) +|\n+', text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
+def simple_summarize(text, target_ratio=0.4, min_sentences=3, max_sentences=10):
+    if not text or len(text.strip()) < 20: return text.strip()
+    clean_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+    sentences = re.split(r'(?<=[.!?])\s+', clean_text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if not sentences: return ""
+    num_sentences = int(len(sentences) * target_ratio)
+    num_sentences = max(min_sentences, min(num_sentences, max_sentences))
     if len(sentences) <= num_sentences: return " ".join(sentences)
-        
-    words = re.findall(r'\b\w+\b', text.lower())
+    stop_words = {"the", "is", "in", "and", "to", "of", "a", "for", "on", "with", "as", "by", "this", "that", "it", "are", "be", "or", "an", "at", "from", "which", "will"}
+    words = re.findall(r'\b[a-zA-Z]{2,}\b', clean_text.lower())
     freq = {}
     for w in words:
-        if w not in stop_words and not w.isnumeric(): freq[w] = freq.get(w, 0) + 1
-            
+        if w not in stop_words: freq[w] = freq.get(w, 0) + 1
+    max_freq = max(freq.values()) if freq else 1
+    for w in freq: freq[w] = freq[w] / max_freq
     scores = {}
     for i, s in enumerate(sentences):
         score = 0
-        s_words = re.findall(r'\b\w+\b', s.lower())
+        s_words = re.findall(r'\b[a-zA-Z]{2,}\b', s.lower())
         for w in s_words:
             if w in freq: score += freq[w]
-        scores[i] = score / max(len(s_words), 1)
-        
+        score = score / max(len(s_words), 1)
+        if i < 2: score += 0.5
+        scores[i] = score
     top_indices = sorted(sorted(scores, key=scores.get, reverse=True)[:num_sentences])
     return " ".join([sentences[i] for i in top_indices])
 
@@ -189,7 +562,38 @@ class NotesEditor(QTextEdit):
         super().insertFromMimeData(source)
 
 # ==========================================
-# --- PURE CODE ANALYSIS WORKER (SMART EXTRACTION) ---
+# --- SELECTABLE TEXT PREVIEW TAB ---
+# ==========================================
+class SelectableTextPreview(QTextEdit):
+    text_extracted = pyqtSignal(str)
+    summary_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setStyleSheet("""
+            QTextEdit { background: #ffffff; color: #212529; font-size: 14px; 
+            line-height: 1.6; padding: 15px; border: none; }
+        """)
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        if self.textCursor().hasSelection():
+            menu.addSeparator()
+            extract_action = menu.addAction("📝 Extract Selected Text to Notes")
+            summarize_action = menu.addAction("✨ Summarize Selection (Set as Intro)")
+            
+            action = menu.exec(event.globalPos())
+            
+            if action == extract_action:
+                self.text_extracted.emit(self.textCursor().selectedText())
+            elif action == summarize_action:
+                self.summary_requested.emit(self.textCursor().selectedText())
+        else:
+            menu.exec(event.globalPos())
+
+# ==========================================
+# --- PURE PYTHON ANALYSIS WORKER ---
 # ==========================================
 class AnalysisWorker(QThread):
     finished = pyqtSignal(dict) 
@@ -202,16 +606,12 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            results = {
-                "project_name": "",
-                "introduction": "",
-                "found_topics": []
-            }
-
+            results = {"project_name": "", "introduction": "", "found_topics": []}
+            
             explicit_match = re.search(r'(?:Project\s*Name|Project\s*Title|Title|Subject)[\s:]*(.+)', self.text, re.IGNORECASE)
             if explicit_match and not explicit_match.group(1).strip().startswith("___"):
                 results["project_name"] = explicit_match.group(1).strip()[:100]
-            
+                
             if not results["project_name"]:
                 semantic_match = re.search(r'(?:project|report|proposal) (?:aims to|focuses on|proposes|is to|investigates) ([^\.]+)', self.text, re.IGNORECASE)
                 if semantic_match:
@@ -225,21 +625,19 @@ class AnalysisWorker(QThread):
                         results["project_name"] = line
                         break
 
-            results["introduction"] = simple_summarize(self.text, num_sentences=4)
-
+            results["introduction"] = simple_summarize(self.text)
+            
             for topic in self.topics:
-                if topic.lower() in self.text.lower():
-                    results["found_topics"].append(topic)
-
+                if topic.lower() in self.text.lower(): results["found_topics"].append(topic)
             if results["introduction"] and "Introduction" not in results["found_topics"]:
                 results["found_topics"].append("Introduction")
-
+                
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(str(e))
 
 # ==========================================
-# --- INTERACTIVE PDF SNIPPING & PANNING TOOL ---
+# --- INTERACTIVE PDF SNIPPING & PANNING ---
 # ==========================================
 class PdfPageLabel(QLabel):
     text_extracted = pyqtSignal(str)
@@ -266,17 +664,13 @@ class PdfPageLabel(QLabel):
     def mouseMoveEvent(self, event):
         if not self.origin.isNull() and (event.buttons() & Qt.MouseButton.LeftButton):
             self.rubber_band.setGeometry(QRect(self.origin, event.pos()).normalized())
-            
         elif self.pan_start_pos is not None and (event.buttons() & (Qt.MouseButton.RightButton | Qt.MouseButton.MiddleButton)):
             current_pos = event.globalPosition().toPoint()
             delta = current_pos - self.pan_start_pos
-            
             h_bar = self.scroll_area.horizontalScrollBar()
             v_bar = self.scroll_area.verticalScrollBar()
-            
             h_bar.setValue(h_bar.value() - delta.x())
             v_bar.setValue(v_bar.value() - delta.y())
-            
             self.pan_start_pos = current_pos
 
     def mouseReleaseEvent(self, event):
@@ -287,7 +681,6 @@ class PdfPageLabel(QLabel):
             else:
                 self.rubber_band.hide()
             self.origin = QPoint()
-            
         elif event.button() in [Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton]:
             self.unsetCursor()
             self.pan_start_pos = None
@@ -305,16 +698,14 @@ class PdfPageLabel(QLabel):
         self.rubber_band.hide() 
         menu = QMenu(self)
         menu.setStyleSheet("""
-            QMenu { background-color: white; border: 1px solid #ced4da; border-radius: 4px; padding: 4px; font-size: 13px; }
+            QMenu { background-color: #ffffff; border: 1px solid #ced4da; border-radius: 4px; padding: 4px; font-size: 13px; color: #212529; }
             QMenu::item { padding: 6px 25px 6px 20px; background-color: transparent; }
-            QMenu::item:selected { background-color: #e2e6ea; color: black; border-radius: 3px; }
+            QMenu::item:selected { background-color: #f8f9fa; border-radius: 3px; }
         """)
-
         copy_img_action = menu.addAction("🖼️ Extract as Image")
         copy_text_action = menu.addAction("📝 Extract Text to Notes")
         menu.addSeparator()
         summarize_action = menu.addAction("✨ Summarize Selection (Set as Intro)")
-
         action = menu.exec(self.mapToGlobal(pos))
         
         if action == copy_img_action:
@@ -332,7 +723,7 @@ class PdfPageLabel(QLabel):
 class OfflineApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Offline Document Assistant - Fast Analyzer")
+        self.setWindowTitle("Document Extraction Assistant")
         self.resize(1450, 950) 
         
         self.file_path = ""
@@ -341,218 +732,374 @@ class OfflineApp(QMainWindow):
         self.current_zoom = 600 
         self.is_maximized = False
         
+        # Data Variables
+        self.extracted_project_name = "" 
         self.intro_text_data = "" 
-        self.combos = {}
+        self.stakeholders_data = []
+        self.cert_task_data = [] 
         
+        self.apply_light_theme()
+        
+        # Initialize Popups
+        self.init_data_dialog()
+        self.init_tables_dialog()
         self.init_ui()
+
+    def apply_light_theme(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget#mainWidget, QMessageBox { 
+                background-color: #f8f9fa; color: #212529; font-family: 'Segoe UI', sans-serif; font-size: 13px;
+            }
+            QFrame[class="Card"] { background: #ffffff; border-radius: 8px; border: 1px solid #dee2e6; }
+            QGroupBox { border: 1px solid #dee2e6; border-radius: 8px; margin-top: 15px; font-weight: bold; background: #ffffff;}
+            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; color: #0d6efd; }
+            QPushButton#PrimaryBtn { background-color: #0d6efd; color: #ffffff; border: none; padding: 8px 15px; border-radius: 4px; font-weight: bold; }
+            QPushButton#PrimaryBtn:hover { background-color: #0b5ed7; }
+            QPushButton#SecondaryBtn { background-color: #ffffff; color: #212529; border: 1px solid #ced4da; padding: 8px 15px; border-radius: 4px; font-weight: bold; }
+            QPushButton#SecondaryBtn:hover { background-color: #f8f9fa; }
+            QPushButton#ToolbarBtn { background-color: #ffffff; border: 1px solid #ced4da; border-radius: 22px; font-size: 20px; }
+            QPushButton#ToolbarBtn:hover { background-color: #e9ecef; }
+            QLineEdit, QTextEdit { background: #ffffff; color: #212529; border: 1px solid #ced4da; border-radius: 6px; padding: 8px; }
+            QLineEdit:focus, QTextEdit:focus { border: 1px solid #0d6efd; }
+            QLabel { color: #343a40; }
+            QCheckBox { color: #212529; spacing: 8px; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #ced4da; border-radius: 4px; background: #ffffff; }
+            QCheckBox::indicator:checked { background: #0d6efd; border: 1px solid #0d6efd; }
+            QScrollBar:vertical { border: none; background: #f8f9fa; width: 10px; margin: 0px; }
+            QScrollBar::handle:vertical { background: #ced4da; min-height: 20px; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #adb5bd; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { border: none; background: none; }
+            QSplitter::handle { background: #dee2e6; width: 4px; }
+        """)
 
     def init_ui(self):
         main_widget = QWidget()
+        main_widget.setObjectName("mainWidget")
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # --- LEFT SIDE: Document Viewer ---
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
-        left_controls_layout = QHBoxLayout()
-        
-        self.upload_btn = QPushButton(" 📂 Upload PDF Document")
-        self.upload_btn.setStyleSheet("height: 40px; font-weight: bold; background-color: #f8f9fa; padding: 0 15px;")
-        self.upload_btn.clicked.connect(self.upload_file)
-        
-        self.zoom_out_btn = QPushButton("➖")
-        self.zoom_in_btn = QPushButton("➕")
-        self.maximize_btn = QPushButton("🗖") 
-        for btn in [self.zoom_out_btn, self.zoom_in_btn, self.maximize_btn]:
-            btn.setFixedSize(40, 40)
-            btn.setStyleSheet("font-size: 16px; font-weight: bold; background-color: #ffffff; border: 1px solid #ced4da; border-radius: 4px;")
-            
-        self.zoom_out_btn.clicked.connect(lambda: self.zoom_out(150))
-        self.zoom_in_btn.clicked.connect(lambda: self.zoom_in(150))
-        self.maximize_btn.clicked.connect(self.toggle_maximize)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
 
-        left_controls_layout.addWidget(self.upload_btn)
-        left_controls_layout.addStretch()
-        left_controls_layout.addWidget(QLabel("Zoom:"))
-        left_controls_layout.addWidget(self.zoom_out_btn)
-        left_controls_layout.addWidget(self.zoom_in_btn)
-        left_controls_layout.addWidget(self.maximize_btn)
+        controls_layout = QHBoxLayout()
+        self.upload_btn = QPushButton("📂 Upload PDF")
+        self.upload_btn.setObjectName("PrimaryBtn")
+        self.upload_btn.clicked.connect(self.upload_file)
+        controls_layout.addWidget(self.upload_btn)
+        
+        controls_layout.addStretch()
+        
+        self.paste_notes_btn = QPushButton("📋 Paste to Notes")
+        self.paste_notes_btn.setObjectName("SecondaryBtn")
+        self.paste_notes_btn.clicked.connect(self.paste_to_notes)
+        controls_layout.addWidget(self.paste_notes_btn)
+        
+        self.summarize_btn = QPushButton("✨ Summarize Copied Text")
+        self.summarize_btn.setObjectName("SecondaryBtn")
+        self.summarize_btn.clicked.connect(self.summarize_clipboard)
+        controls_layout.addWidget(self.summarize_btn)
+
+        left_layout.addLayout(controls_layout)
+
+        self.left_tabs = QTabWidget()
+        self.left_tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #dee2e6; border-radius: 6px; background: white; top:-1px; }
+            QTabBar::tab { background: #f8f9fa; color: #6c757d; padding: 10px 20px; border: 1px solid #dee2e6; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; font-weight: bold;}
+            QTabBar::tab:selected { background: white; color: #0d6efd; border-top: 3px solid #0d6efd; border-bottom-color: white;}
+        """)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("background-color: #525659;") 
+        self.scroll_area.setStyleSheet("background: #f8f9fa; border: none;") 
         self.page_container = QWidget()
+        self.page_container.setStyleSheet("background: transparent;")
         self.page_layout = QVBoxLayout(self.page_container)
         self.page_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter) 
         self.scroll_area.setWidget(self.page_container)
         self.scroll_area.viewport().installEventFilter(self)
 
-        self.text_preview = QTextEdit()
-        self.text_preview.setReadOnly(True)
-        self.text_preview.hide()
+        if HAS_WEBENGINE:
+            self.pdf_viewer = PDFWebEngineView(self)
+            self.pdf_viewer.settings().setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+            self.pdf_viewer.settings().setAttribute(QWebEngineSettings.WebAttribute.PdfViewerEnabled, True)
+            self.pdf_viewer.setStyleSheet("border: none;")
+            self.left_tabs.addTab(self.pdf_viewer, "📝 Native PDF Viewer (Text Selection)")
+            self.left_tabs.addTab(self.scroll_area, "🖼️ Visual Image Extractor")
+        else:
+            self.text_preview = SelectableTextPreview()
+            self.text_preview.text_extracted.connect(self.add_extracted_text)
+            self.text_preview.summary_requested.connect(self.generate_summary_from_selection)
+            self.left_tabs.addTab(self.scroll_area, "🖼️ Visual Image Extractor")
+            self.left_tabs.addTab(self.text_preview, "📝 Raw Text Viewer")
+        
+        left_layout.addWidget(self.left_tabs)
 
-        left_layout.addLayout(left_controls_layout)
-        tip_label = QLabel("💡 Tip: Click and drag on the PDF to extract text, flowcharts, or generate your Introduction Summary!")
-        tip_label.setStyleSheet("color: #0056b3; font-style: italic;")
-        left_layout.addWidget(tip_label)
-        left_layout.addWidget(self.scroll_area)
-        left_layout.addWidget(self.text_preview)
-
-        # --- RIGHT SIDE: Tools & Dashboards ---
+        # --- RIGHT SIDE: IDE Tools ---
         self.right_container = QWidget() 
         right_layout = QVBoxLayout(self.right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
 
-        header_layout = QHBoxLayout()
+        icon_layout = QHBoxLayout()
+        icon_layout.addStretch()
+        
+        icon_lbl = QLabel("📄 Document Assistant  | ")
+        icon_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #6c757d; margin-right: 10px;")
+        icon_layout.addWidget(icon_lbl)
+        
+        self.tables_icon_btn = QPushButton("🗂️")
+        self.tables_icon_btn.setFixedSize(45, 45)
+        self.tables_icon_btn.setToolTip("Manage Project Tables")
+        self.tables_icon_btn.setObjectName("ToolbarBtn")
+        self.tables_icon_btn.clicked.connect(self.show_tables_popup)
+        icon_layout.addWidget(self.tables_icon_btn)
+        
+        self.data_icon_btn = QPushButton("📝")
+        self.data_icon_btn.setFixedSize(45, 45)
+        self.data_icon_btn.setToolTip("View/Edit Project Data & Notes")
+        self.data_icon_btn.setObjectName("ToolbarBtn")
+        self.data_icon_btn.clicked.connect(lambda: self.show_data_popup(0))
+        icon_layout.addWidget(self.data_icon_btn)
+        
+        right_layout.addLayout(icon_layout)
 
-        # Checkbox Grid
-        self.status_group = QGroupBox("Task Directive Extraction Checklist")
-        self.status_group.setMaximumHeight(190) 
+        self.status_group = QGroupBox("Extraction Checklist")
+        status_main_layout = QVBoxLayout(self.status_group)
+        status_main_layout.setContentsMargins(10, 15, 10, 5) 
         
-        status_main_layout = QVBoxLayout()
-        status_main_layout.setContentsMargins(10, 15, 10, 10) 
-        status_main_layout.setSpacing(5) 
-        
-        top_status = QHBoxLayout()
-        self.check_upload = QCheckBox("File Uploaded")
-        self.check_upload.setEnabled(False)
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: gray; font-style: italic;")
-        
+        status_header = QHBoxLayout()
+        self.status_label = QLabel("Waiting for document...")
+        self.status_label.setStyleSheet("color: #6c757d; font-style: italic;")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0) 
         self.progress_bar.hide()
-        
-        top_status.addWidget(self.check_upload)
-        top_status.addStretch()
-        top_status.addWidget(self.status_label)
-        top_status.addWidget(self.progress_bar) 
-        status_main_layout.addLayout(top_status)
+        status_header.addWidget(self.status_label)
+        status_header.addWidget(self.progress_bar) 
+        status_main_layout.addLayout(status_header)
         
         self.topics = [
             "Introduction", "Reference", "Basis Of Task Directive",
-            "Scope Of Task Directive", "Stakeholders", "Certification Work Breakdown",
-            "Task Allocation", "Coordinating Directorate", "Single Point of Contact",
-            "Certification Task Allocation", "Issue of Clearance", "SCRB And TARB",
-            "Communication", "Certification Progress Review", "Distribution List"
+            "Scope", "Stakeholders", "Cert Breakdown",
+            "Task Allocation", "Coordinating Dir.", "SPoC",
+            "Cert Allocation", "Clearance Issue", "SCRB & TARB",
+            "Communication", "Review", "Distribution List"
         ]
         self.topic_checkboxes = {}
         
-        topics_scroll = QScrollArea()
-        topics_scroll.setWidgetResizable(True)
-        topics_scroll.setFixedHeight(120) 
-        topics_scroll.setStyleSheet("QScrollArea { border: 1px solid #ced4da; border-radius: 4px; background-color: #f8f9fa; }")
-        
         topics_widget = QWidget()
         topics_layout = QGridLayout(topics_widget) 
-        topics_layout.setContentsMargins(5, 5, 5, 5)
+        topics_layout.setContentsMargins(0, 5, 0, 0)
+        topics_layout.setSpacing(4)
         
         row, col = 0, 0
         for topic in self.topics:
             cb = QCheckBox(topic)
-            cb.setStyleSheet("font-size: 11px;")
+            cb.setEnabled(False) 
             self.topic_checkboxes[topic] = cb
             topics_layout.addWidget(cb, row, col)
             col += 1
-            if col > 1: 
+            if col > 2:  
                 col = 0
                 row += 1
 
-        topics_scroll.setWidget(topics_widget)
-        status_main_layout.addWidget(topics_scroll)
-        self.status_group.setLayout(status_main_layout)
+        status_main_layout.addWidget(topics_widget)
+        right_layout.addWidget(self.status_group)
+
+        self.collapsible_params = CollapsibleBox("ADDITIONAL TASK PARAMETERS")
         
-        header_layout.addWidget(self.status_group)
-
-        self.summary_icon_btn = QPushButton("📑")
-        self.summary_icon_btn.setFixedSize(65, 65)
-        self.summary_icon_btn.setToolTip("View/Edit Introduction Summary")
-        self.summary_icon_btn.setStyleSheet("""
-            QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
-            QPushButton:hover { background-color: #e2e6ea; }
-        """)
-        self.summary_icon_btn.clicked.connect(self.show_summary_popup)
-        header_layout.addWidget(self.summary_icon_btn, alignment=Qt.AlignmentFlag.AlignTop)
-
-        right_layout.addLayout(header_layout) 
-
-        # --- TEXT BOXES & NEW DROPDOWNS ---
-        right_layout.addWidget(QLabel(" 🏷️ Project Name:"))
-        self.project_name_input = QLineEdit()
-        self.project_name_input.setPlaceholderText("Type or paste Project Name here...")
-        self.project_name_input.setStyleSheet("background-color: white; font-size: 14px; padding: 5px; border: 1px solid #ced4da; border-radius: 4px;")
-        right_layout.addWidget(self.project_name_input) 
-        
-        # Inject the new Popup Dropdowns
         dropdowns_data = [
             ("Scope Of Task Directive", ["Option 1", "Option 2", "Option 3"]),
-            ("Stakeholders", ["Internal", "External", "Both"]),
             ("Certification Work Breakdown", ["Type A", "Type B", "Type C"]),
             ("Task Allocation", ["Auto", "Manual", "Hybrid"]),
             ("Communication Type", ["Email", "Meeting", "Report"])
         ]
         
+        self.combos = {}
+        
+        param_scroll = QScrollArea()
+        param_scroll.setWidgetResizable(True)
+        param_scroll.setStyleSheet("border: none; background: transparent;")
+        param_widget = QWidget()
+        param_layout = QVBoxLayout(param_widget)
+        param_layout.setContentsMargins(0, 0, 0, 0)
+        param_layout.setSpacing(10)
+        
         for label_text, items in dropdowns_data:
-            row_layout = QHBoxLayout()
-            lbl = QLabel(f" ⏷ {label_text}:")
-            lbl.setStyleSheet("font-weight: bold; color: #0056b3;")
-            lbl.setFixedWidth(200)
+            row = QVBoxLayout()
+            row.setSpacing(2)
+            lbl = QLabel(label_text.upper())
+            lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #6c757d;")
             combo = PopupMultiSelect(items)
             self.combos[label_text] = combo
-            row_layout.addWidget(lbl)
-            row_layout.addWidget(combo)
-            right_layout.addLayout(row_layout)
-
-        right_layout.addWidget(QLabel(" ✍️ Manual Notes, Stakeholders, & Other Data:"))
-        self.manual_input = NotesEditor()
-        self.manual_input.setPlaceholderText("Extract Stakeholders, Scope, and flowcharts here...")
-        self.manual_input.setStyleSheet("background-color: white; font-size: 13px;")
-        right_layout.addWidget(self.manual_input) 
-
-        btn_layout = QHBoxLayout()
-        self.save_docx_btn = QPushButton(" 📝 Generate Task Directive (Word)")
-        self.save_docx_btn.setStyleSheet("background-color: #2b579a; color: white; font-weight: bold;")
-        self.save_docx_btn.setFixedHeight(50)
-        self.save_docx_btn.clicked.connect(self.export_docx)
-        btn_layout.addWidget(self.save_docx_btn)
+            row.addWidget(lbl)
+            row.addWidget(combo)
+            param_layout.addLayout(row)
+            
+        param_layout.addStretch()
+        param_scroll.setWidget(param_widget)
+        self.collapsible_params.content_layout.addWidget(param_scroll)
         
-        right_layout.addLayout(btn_layout)
+        right_layout.addWidget(self.collapsible_params, stretch=1)
+
+        actions_layout = QHBoxLayout()
+
+        self.save_pdf_btn = QPushButton("💾 View Basic PDF")
+        self.save_pdf_btn.setObjectName("SecondaryBtn")
+        self.save_pdf_btn.setFixedHeight(45)
+        self.save_pdf_btn.clicked.connect(self.export_pdf)
+        actions_layout.addWidget(self.save_pdf_btn)
+
+        self.save_docx_btn = QPushButton("Generate Word Doc")
+        self.save_docx_btn.setObjectName("PrimaryBtn")
+        self.save_docx_btn.setFixedHeight(45)
+        self.save_docx_btn.clicked.connect(self.export_docx)
+        actions_layout.addWidget(self.save_docx_btn, stretch=1)
+
+        right_layout.addLayout(actions_layout)
 
         self.splitter.addWidget(left_container)
         self.splitter.addWidget(self.right_container)
         self.splitter.setStretchFactor(0, 5) 
-        self.splitter.setStretchFactor(1, 5) 
+        self.splitter.setStretchFactor(1, 4) 
         layout.addWidget(self.splitter)
 
     # ------------------------------------------
-    # --- EDITABLE SUMMARY POPUP ---
+    # --- EDITABLE POPUPS ---
     # ------------------------------------------
-    def show_summary_popup(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("📑 Edit Introduction Summary")
-        dialog.resize(600, 400)
-        layout = QVBoxLayout(dialog)
-
-        text_edit = QTextEdit()
-        text_edit.setText(self.intro_text_data)
-        text_edit.setStyleSheet("font-size: 14px; line-height: 1.6; padding: 10px;")
+    def init_data_dialog(self):
+        self.data_dialog = QDialog(self)
+        self.data_dialog.setWindowTitle("🗂️ Project Data & Notes")
+        self.data_dialog.resize(750, 650)
         
-        text_edit.textChanged.connect(lambda: setattr(self, 'intro_text_data', text_edit.toPlainText()))
+        dialog_layout = QVBoxLayout(self.data_dialog)
+        dialog_layout.setContentsMargins(15, 15, 15, 15)
+        dialog_layout.setSpacing(15)
 
+        self.data_tabs = QTabWidget()
+        self.data_dialog.setStyleSheet("""
+            QDialog { background-color: #f8f9fa; }
+            QLabel { font-weight: bold; color: #343a40; font-size: 13px; margin-top: 5px; }
+            QLineEdit, QTextEdit { 
+                background-color: #ffffff; 
+                border: 1px solid #ced4da; 
+                border-radius: 6px; 
+                padding: 10px; 
+                font-size: 14px;
+                color: #212529;
+            }
+            QLineEdit:focus, QTextEdit:focus { border: 1px solid #0d6efd; }
+            QTabWidget::pane { border: 1px solid #dee2e6; background: #ffffff; border-radius: 4px; top: -1px; }
+            QTabBar::tab { background: #f8f9fa; color: #6c757d; padding: 10px 20px; border: 1px solid #dee2e6; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; font-weight: bold; }
+            QTabBar::tab:selected { background: #ffffff; color: #0d6efd; border-top: 3px solid #0d6efd; border-bottom-color: white; }
+            QPushButton#SaveCloseBtn { background-color: #0d6efd; color: white; font-size: 15px; font-weight: bold; border-radius: 6px; border: none; }
+            QPushButton#SaveCloseBtn:hover { background-color: #0b5ed7; }
+        """)
+        
+        summary_tab = QWidget()
+        summary_tab.setStyleSheet("background: white;")
+        summary_layout = QVBoxLayout(summary_tab)
+        summary_layout.setContentsMargins(20, 20, 20, 20)
+        
+        name_lbl = QLabel("Project Name:")
+        summary_layout.addWidget(name_lbl)
+
+        self.popup_name_edit = QLineEdit()
+        self.popup_name_edit.textChanged.connect(lambda text: setattr(self, 'extracted_project_name', text))
+        summary_layout.addWidget(self.popup_name_edit)
+
+        sum_lbl = QLabel("Introduction Summary:")
+        summary_layout.addWidget(sum_lbl)
+
+        self.popup_summary_edit = QTextEdit()
+        self.popup_summary_edit.textChanged.connect(lambda: setattr(self, 'intro_text_data', self.popup_summary_edit.toPlainText()))
+        summary_layout.addWidget(self.popup_summary_edit)
+        
+        notes_tab = QWidget()
+        notes_tab.setStyleSheet("background: white;")
+        notes_layout = QVBoxLayout(notes_tab)
+        notes_layout.setContentsMargins(20, 20, 20, 20)
+        
+        self.manual_input = NotesEditor()
+        self.manual_input.setPlaceholderText("Paste text, images, and flowcharts here...")
+        notes_layout.addWidget(self.manual_input)
+        
+        self.data_tabs.addTab(summary_tab, "📑 Summary")
+        self.data_tabs.addTab(notes_tab, "📝 Manual Notes")
+        
+        dialog_layout.addWidget(self.data_tabs)
+        
         close_btn = QPushButton("Save & Close")
-        close_btn.setFixedHeight(40)
-        close_btn.clicked.connect(dialog.accept)
+        close_btn.setObjectName("SaveCloseBtn")
+        close_btn.setFixedHeight(45)
+        close_btn.clicked.connect(self.data_dialog.hide)
+        dialog_layout.addWidget(close_btn)
 
-        layout.addWidget(text_edit)
-        layout.addWidget(close_btn)
-        dialog.exec()
+    def show_data_popup(self, tab_index=0):
+        self.popup_name_edit.setText(self.extracted_project_name)
+        self.popup_summary_edit.setText(self.intro_text_data)
+        self.data_tabs.setCurrentIndex(tab_index)
+        self.data_dialog.show()
+        self.data_dialog.raise_()
+        self.data_dialog.activateWindow()
+
+    def init_tables_dialog(self):
+        self.tables_dialog = ProjectTablesDialog(self)
+
+    def show_tables_popup(self):
+        self.tables_dialog.show()
+        self.tables_dialog.raise_()
+        self.tables_dialog.activateWindow()
 
     # ------------------------------------------
     # --- AUTO-PASTING FUNCTIONS ---
     # ------------------------------------------
+    def flash_data_icon(self):
+        self.data_icon_btn.setStyleSheet("""
+            QPushButton { background-color: #198754; color: #FFFFFF; border: none; border-radius: 22px; font-weight: bold; font-size: 20px;}
+        """)
+
+    def paste_to_notes(self):
+        clipboard_text = QApplication.clipboard().text()
+        if clipboard_text.strip():
+            self.manual_input.append(clipboard_text + "\n")
+            self.flash_data_icon()
+            QMessageBox.information(self, "Success", "Copied text added to Manual Notes!")
+        else:
+            QMessageBox.warning(self, "Empty", "Please copy some text from the PDF first (Ctrl+C).")
+            
+    def summarize_clipboard(self):
+        clipboard_text = QApplication.clipboard().text()
+        if clipboard_text.strip():
+            self.generate_summary_from_selection(clipboard_text)
+        else:
+            QMessageBox.warning(self, "Empty", "Please copy some text from the PDF first (Ctrl+C).")
+
+    def generate_summary_from_selection(self, text):
+        self.status_label.setText("Summarizing selection...")
+        QApplication.processEvents()
+        
+        summary = simple_summarize(text)
+        if summary:
+            self.intro_text_data = summary 
+            self.popup_summary_edit.setText(summary)
+            self.flash_data_icon()
+            self.status_label.setText("Ready")
+            self.topic_checkboxes["Introduction"].setChecked(True)
+            QMessageBox.information(self, "Success", "Selection summarized! Click the 📝 icon to view or edit it.")
+        else:
+            self.status_label.setText("Ready")
+            QMessageBox.warning(self, "Empty", "Could not generate a summary. Try copying a larger paragraph.")
+            
     def add_extracted_text(self, text):
         QApplication.clipboard().setText(text) 
         self.manual_input.append(text + "\n")
+        self.flash_data_icon()
         
     def add_extracted_image(self, pixmap):
         if pixmap.width() > 500:
@@ -563,23 +1110,7 @@ class OfflineApp(QMainWindow):
         self.manual_input.setTextCursor(cursor)
         cursor.insertImage(pixmap.toImage()) 
         self.manual_input.append("\n") 
-        
-    def generate_summary_from_selection(self, text):
-        self.status_label.setText("Summarizing selection...")
-        QApplication.processEvents()
-        summary = simple_summarize(text, num_sentences=4)
-        if summary:
-            self.intro_text_data = summary 
-            self.summary_icon_btn.setStyleSheet("""
-                QPushButton { font-size: 30px; border-radius: 32px; background-color: #d4edda; border: 2px solid #28a745; }
-                QPushButton:hover { background-color: #c3e6cb; }
-            """)
-            self.status_label.setText("Ready")
-            self.topic_checkboxes["Introduction"].setChecked(True)
-            QMessageBox.information(self, "Success", "Selection summarized! Click the 📑 icon to view or edit it.")
-        else:
-            self.status_label.setText("Ready")
-            QMessageBox.warning(self, "Empty", "Could not generate a summary. Try selecting a larger paragraph.")
+        self.flash_data_icon()
 
     # ------------------------------------------
     # --- UI INTERACTION FUNCTIONS ---
@@ -592,16 +1123,6 @@ class OfflineApp(QMainWindow):
                 elif delta < 0: self.zoom_out(step=50)
                 return True 
         return super().eventFilter(source, event)
-
-    def toggle_maximize(self):
-        if not self.is_maximized:
-            self.right_container.hide() 
-            self.maximize_btn.setText("🗗") 
-            self.is_maximized = True
-        else:
-            self.right_container.show() 
-            self.maximize_btn.setText("🗖") 
-            self.is_maximized = False
 
     def zoom_in(self, step=150):
         self.current_zoom += step
@@ -625,7 +1146,7 @@ class OfflineApp(QMainWindow):
                 lbl.text_extracted.connect(self.add_extracted_text)
                 lbl.image_extracted.connect(self.add_extracted_image)
                 lbl.summary_requested.connect(self.generate_summary_from_selection)
-                lbl.setStyleSheet("background-color: white; border: 1px solid black; margin-bottom: 10px;")
+                lbl.setStyleSheet("background-color: white; border: 1px solid #ced4da; margin-bottom: 10px; border-radius: 4px;")
                 self.page_layout.addWidget(lbl)
 
         for i in range(self.page_layout.count()):
@@ -643,36 +1164,34 @@ class OfflineApp(QMainWindow):
         if path:
             self.file_path = path
             
-            self.check_upload.setChecked(False)
-            for cb in self.topic_checkboxes.values():
-                cb.setChecked(False)
+            for cb in self.topic_checkboxes.values(): cb.setChecked(False)
                 
-            self.project_name_input.clear()
+            self.extracted_project_name = ""
             self.intro_text_data = "" 
-            self.summary_icon_btn.setStyleSheet("""
-                QPushButton { font-size: 30px; border-radius: 32px; background-color: #f8f9fa; border: 2px solid #ced4da; }
-                QPushButton:hover { background-color: #e2e6ea; }
-            """)
             
-            # Reset Combos
-            for combo in self.combos.values():
-                if combo.popup:
-                    for i in range(combo.popup.list_widget.count()):
-                        combo.popup.list_widget.item(i).setCheckState(Qt.CheckState.Unchecked)
-                combo.setText("Select options...")
+            default_icon_style = """
+                QPushButton { font-size: 20px; border-radius: 22px; background-color: #ffffff; border: 1px solid #ced4da; }
+                QPushButton:hover { background-color: #e9ecef; }
+            """
+            self.data_icon_btn.setStyleSheet(default_icon_style)
             
             self.manual_input.clear() 
-            self.page_data.clear() 
             
             try:
+                full_text = ""
                 if path.lower().endswith('.pdf'):
-                    self.text_preview.hide()
-                    self.scroll_area.show()
-                    self.doc = fitz.open(path)
-                    
-                    self.status_label.setText("Loading PDF Pages...")
+                    if HAS_WEBENGINE:
+                        self.pdf_viewer.setUrl(QUrl.fromLocalFile(os.path.abspath(path)))
+                        self.left_tabs.setCurrentIndex(0)
+                    else:
+                        self.left_tabs.setCurrentIndex(1)
+                        
+                    self.status_label.setText("Extracting backend data...")
                     QApplication.processEvents()
-
+                    self.doc = fitz.open(path)
+                    full_text = "".join(page.get_text() for page in self.doc)
+                    
+                    self.page_data.clear()
                     for i, page in enumerate(self.doc):
                         if i < 15: 
                             pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
@@ -680,16 +1199,17 @@ class OfflineApp(QMainWindow):
                             self.page_data.append((QPixmap.fromImage(img), i))
                     
                     self.current_zoom = 600 
-                    self.refresh_pdf_view() 
+                    self.refresh_pdf_view()
+                    
                 else:
-                    self.scroll_area.hide()
-                    self.text_preview.show()
+                    if HAS_WEBENGINE: self.left_tabs.setCurrentIndex(2)
+                    else: self.left_tabs.setCurrentIndex(1)
+                    
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                        self.text_preview.setText(f.read())
+                        full_text = f.read()
+                        if hasattr(self, 'text_preview'):
+                            self.text_preview.setText(full_text)
 
-                self.check_upload.setChecked(True)
-                
-                full_text = self.text_preview.toPlainText() if not self.doc else "".join(page.get_text() for page in self.doc)
                 self.start_analysis_thread(full_text)
                 
             except Exception as e:
@@ -708,14 +1228,11 @@ class OfflineApp(QMainWindow):
         self.status_label.setText("Analysis Complete")
         
         if results["project_name"]:
-            self.project_name_input.setText(results["project_name"])
+            self.extracted_project_name = results["project_name"]
             
         if results["introduction"]:
             self.intro_text_data = results["introduction"]
-            self.summary_icon_btn.setStyleSheet("""
-                QPushButton { font-size: 30px; border-radius: 32px; background-color: #d4edda; border: 2px solid #28a745; }
-                QPushButton:hover { background-color: #c3e6cb; }
-            """)
+            self.flash_data_icon()
             
         for topic in results["found_topics"]:
             if topic in self.topic_checkboxes:
@@ -724,6 +1241,50 @@ class OfflineApp(QMainWindow):
     # ------------------------------------------
     # --- TEMPLATE INJECTION & EXPORT ---
     # ------------------------------------------
+    def export_pdf(self):
+        try:
+            temp_file = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            temp_path = temp_file.name
+            temp_file.close() 
+
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(temp_path)
+            
+            ai_html = self.intro_text_data.replace('\n', '<br>')
+            manual_html = self.manual_input.toHtml()
+            
+            scope_combo = self.combos.get("Scope Of Task Directive")
+            scope_text = "<br>".join(scope_combo.checkedItems()) if scope_combo and scope_combo.checkedItems() else "____"
+            
+            sth_html = "<table border='1' cellspacing='0' cellpadding='5' width='100%'><tr><th>Sl No.</th><th>Organisation</th><th>Role</th><th>Activities</th></tr>"
+            if hasattr(self, 'stakeholders_data') and self.stakeholders_data:
+                for i, sh in enumerate(self.stakeholders_data):
+                    sth_html += f"<tr><td>{i+1}</td><td>{sh.get('org', '')}</td><td>{sh.get('role', '')}</td><td>{sh.get('activities', '')}</td></tr>"
+            else:
+                sth_html += "<tr><td>&nbsp;</td><td></td><td></td><td></td></tr>"
+            sth_html += "</table>"
+            
+            ct_html = "<table border='1' cellspacing='0' cellpadding='5' width='100%'><tr><th>Sl No.</th><th>Certification Activity</th><th>Certification Work Centre</th><th>Responsible Head</th></tr>"
+            if hasattr(self, 'cert_task_data') and self.cert_task_data:
+                for i, ct in enumerate(self.cert_task_data):
+                    ct_html += f"<tr><td>{i+1}</td><td>{ct.get('activity', '')}</td><td>{ct.get('centre', '')}</td><td>{ct.get('head', '')}</td></tr>"
+            else:
+                ct_html += "<tr><td>&nbsp;</td><td></td><td></td><td></td></tr>"
+            ct_html += "</table>"
+            
+            final_html = f"<h1>Document Analysis Report</h1><hr><h2>1. Introduction Summary</h2><p>{ai_html}</p><br><h2>2. Manual Notes & Flowcharts</h2>{manual_html}<br><h2>Scope of Directive</h2><p>{scope_text}</p><br><h2>Stakeholders</h2>{sth_html}<br><h2>Certification Task Allocation</h2>{ct_html}"
+            
+            doc = QTextDocument()
+            doc.setHtml(final_html)
+            doc.print(printer)
+            
+            self.preview_dialog = PDFViewerDialog(temp_path, self)
+            self.preview_dialog.exec()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Could not generate PDF: {str(e)}")
+
     def export_docx(self):
         save_path, _ = QFileDialog.getSaveFileName(self, "Save Word", "Task_Directive_Final.docx", "Word (*.docx)")
         if not save_path: return
@@ -752,7 +1313,6 @@ class OfflineApp(QMainWindow):
             style = doc.styles['Normal']
             style.font.name = 'Calibri'; style.font.size = Pt(11)
 
-            # --- SECTION 1: COVER PAGE ---
             section1 = doc.sections[0]
             section1.top_margin = Inches(1.5); section1.bottom_margin = Inches(1.5)
             section1.left_margin = Inches(1.5); section1.right_margin = Inches(1.5)
@@ -767,7 +1327,7 @@ class OfflineApp(QMainWindow):
             table = doc.add_table(rows=1, cols=2)
             table.cell(0, 0).text = "Issue No."; table.cell(0, 1).text = "Date of Issue:"
 
-            p_name = self.project_name_input.text().strip()
+            p_name = getattr(self, 'extracted_project_name', '').strip()
             if not p_name or p_name.lower() == "not found":
                 p_name = "__________________________________________"
             doc.add_paragraph(f"\nPROJECT NAME: {p_name}")
@@ -777,7 +1337,6 @@ class OfflineApp(QMainWindow):
             doc.add_paragraph("Address of organization").alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph("Organization details").alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-            # --- SECTION 2: MAIN CONTENT ---
             section2 = doc.add_section(WD_SECTION.NEW_PAGE)
             section2.header.is_linked_to_previous = False; section2.footer.is_linked_to_previous = False
             section2.top_margin = Inches(0.75); section2.bottom_margin = Inches(0.75)
@@ -794,22 +1353,30 @@ class OfflineApp(QMainWindow):
             add_heading(doc, "3. Basis Of Task Directive [Default]")
             doc.add_paragraph("__________________________________________________")
             
-            # Extract from Combo boxes
             scope_combo = self.combos.get("Scope Of Task Directive")
             scope_text = "\n".join(scope_combo.checkedItems()) if scope_combo and scope_combo.checkedItems() else "____"
-            
             add_heading(doc, "4. Scope Of Task Directive [Drop down menu]")
             doc.add_paragraph(f"To assign the certification respectively:\n{scope_text}\n\n1) ____\n2) ____\n3) ____")
 
-            sth_combo = self.combos.get("Stakeholders")
-            sth_text = "\n".join(sth_combo.checkedItems()) if sth_combo and sth_combo.checkedItems() else "Both"
-            
-            add_heading(doc, f"5. Stakeholders [Automated + Manual Notes] ({sth_text})")
+            add_heading(doc, f"5. Stakeholders [Automated + Manual Notes]")
             doc.add_paragraph("The following are the major stakeholders and manual notes extracted:")
             doc.add_paragraph(self.manual_input.toPlainText()) 
 
-            table = doc.add_table(rows=4, cols=4); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl No.", "Organisation", "Role", "Activities"]): table.cell(0, i).text = h
+            table = doc.add_table(rows=1, cols=4)
+            table.style = 'Table Grid'
+            hdr_cells = table.rows[0].cells
+            for i, h in enumerate(["Sl No.", "Organisation", "Role", "Activities"]): 
+                hdr_cells[i].text = h
+
+            if hasattr(self, 'stakeholders_data') and self.stakeholders_data:
+                for i, sh in enumerate(self.stakeholders_data):
+                    row_cells = table.add_row().cells
+                    row_cells[0].text = str(i + 1)
+                    row_cells[1].text = sh.get('org', '')
+                    row_cells[2].text = sh.get('role', '')
+                    row_cells[3].text = sh.get('activities', '')
+            else:
+                for _ in range(3): table.add_row() 
 
             cert_combo = self.combos.get("Certification Work Breakdown")
             cert_text = "\n".join(cert_combo.checkedItems()) if cert_combo and cert_combo.checkedItems() else "______________________________________________"
@@ -826,8 +1393,21 @@ class OfflineApp(QMainWindow):
             doc.add_paragraph("______________________________________________")
 
             add_heading(doc, "7.3 Certification Task Allocation")
-            table = doc.add_table(rows=4, cols=4); table.style = 'Table Grid'
-            for i, h in enumerate(["Sl No.", "Certification Activity", "Certification Work Centre", "Responsible Head"]): table.cell(0, i).text = h
+            table = doc.add_table(rows=1, cols=4)
+            table.style = 'Table Grid'
+            hdr_cells = table.rows[0].cells
+            for i, h in enumerate(["Sl No.", "Certification Activity", "Certification Work Centre", "Responsible Head"]): 
+                hdr_cells[i].text = h
+
+            if hasattr(self, 'cert_task_data') and self.cert_task_data:
+                for i, ct in enumerate(self.cert_task_data):
+                    row_cells = table.add_row().cells
+                    row_cells[0].text = str(i + 1)
+                    row_cells[1].text = ct.get('activity', '')
+                    row_cells[2].text = ct.get('centre', '')
+                    row_cells[3].text = ct.get('head', '')
+            else:
+                for _ in range(3): table.add_row()
 
             add_heading(doc, "7.4 Issue of Clearance [Default]")
             doc.add_paragraph("a. ___\nb. ___\nc. ___\nd. ___\ne. ___\nf. ___\ng. ___")
@@ -845,7 +1425,6 @@ class OfflineApp(QMainWindow):
             add_heading(doc, "11. Distribution List")
             doc.add_paragraph("11.1 External Organization\n1. ___\n2. ___\n3. ___\n11.2 Internal Distribution")
 
-            # --- ANNEXURES ---
             doc.add_page_break()
             add_heading(doc, "Annexure-1")
             doc.add_paragraph("Work Assignment List of LRUs [Automate + Manual]")
